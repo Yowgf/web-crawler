@@ -10,7 +10,7 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
 
     steps:
       - uses: actions/checkout@v3
@@ -19,10 +19,13 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install dependencies
+      - name: install-dependencies
         run: |
+          cat >>requirements.txt<<EOF
+          pytest==4.6.9
+          EOF
           python3 -m pip install -r ./requirements.txt --user
 
-      - name: Unit tests
+      - name: unit-tests
         run: |
           python3 -m pytest -v -o log_cli=true ./crawler
