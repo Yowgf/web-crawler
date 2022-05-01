@@ -17,7 +17,13 @@ class Crawler:
         self._config = config
 
     def init(self):
-        pass
+        seeds_file = self._config.seeds_file
+        try:
+            self.seeds = open(seeds_file, "r").read().split("\n")
+            logger.info(f"Got seed urls from file {seeds_file}: {self.seeds}")
+        except FileNotFoundError as e:
+            logger.error(f"error reading seeds file '{seeds_file}': {e}")
+            raise
 
     def is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
@@ -41,10 +47,23 @@ class Crawler:
 
     # find_relevant_text is like filter_relevant_text, but specialized to return
     # the first relevant text, instead of a list
-    def find_relevant_text(self, soup_elements):
-        for element in soup_elements:
+    def find_relevant_text(self, soup):
+        texts = soup.findAll(text=True)
+
+        relevant_text = ""
+        for element in texts:
             if self.is_relevant_text(element):
-                return element
+                relevant_text = relevant_text + " " + str(element)
+            if len(relevant_text) >= 20:
+                break
+
+        # Trim text
+        relevant_text = relevant_text.strip()
+        while "  " in relevant_text:
+            relevant_text.replace("  ", " ")
+
+        first_20words_relevant_text = str(relevant_text).split(" ")[:20]
+        return " ".join(first_20words_relevant_text)
 
     def print_debug(self, resp):
         debug_json_obj = {}
@@ -53,25 +72,23 @@ class Crawler:
 
         debug_json_obj['URL'] = resp.url
         debug_json_obj['Title'] = str(soup.title.string)
-
-        texts = soup.findAll(text=True)
-        first_relevant_text = self.find_relevant_text(texts)
-        first_20words_relevant_text = str(first_relevant_text).split(" ")[:20]
-
-        debug_json_obj['Text'] = " ".join(first_20words_relevant_text)
+        debug_json_obj['Text'] = self.find_relevant_text(soup)
         debug_json_obj['Timestamp'] = int(time.time())
 
         print(json.dumps(debug_json_obj))
 
-    def run(self):
-        url = 'https://g1.globo.com/'
+    def crawl(self, seed, max_depth=None):
+        logger.debug('Making request to url ' + seed)
 
-        logger.debug('Making request to url ' + url)
-
-        resp = requests.get(url)
+        resp = requests.get(seed)
 
         logger.debug('Got respose: ' + str(resp))
 #        logger.debug('Got html content: ' + resp.text)
 
         if self._config.debug:
             self.print_debug(resp)
+
+    # run assumes that Crawler.init has already been called upon the object.
+    def run(self):
+        for seed in self.seeds:
+            self.crawl(seed, max_depth=10)
