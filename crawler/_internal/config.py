@@ -13,6 +13,8 @@ class Config:
         self.page_limit = page_limit
         self.debug = debug
 
+        self.crawler_name = "simple-web-crawler/v1.0"
+
     def to_json(self):
         def json_mapping(key, val):
             return f'"{key}": "{val}"'
