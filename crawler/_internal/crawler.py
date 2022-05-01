@@ -12,6 +12,7 @@ from reppy.robots import Robots
 from warcio.capture_http import capture_http
 
 from . import log
+from .utils import get_host
 
 logger = log.logger()
 
@@ -77,7 +78,10 @@ class Crawler:
     def print_debug(self, url, soup):
         debug_json_obj = {}
         debug_json_obj['URL'] = url
-        debug_json_obj['Title'] = str(soup.title.string)
+        if soup.title != None:
+            debug_json_obj['Title'] = str(soup.title.string)
+        else:
+            debug_json_obj['Title'] = ""
         debug_json_obj['Text'] = self.find_relevant_text(soup)
         debug_json_obj['Timestamp'] = int(time.time())
 
@@ -89,16 +93,18 @@ class Crawler:
         normalized_url = None
 
         if url.startswith("/"):
-            normalized_url = parent_url.strip("/") + url
+            normalized_url = "http://" + get_host(parent_url) + url
         elif url.startswith("./"):
-            normalized_url = parent_url.strip("/") + url[1:]
+            normalized_url = "http://" + get_host(parent_url) + url[1:]
+        elif url.startswith("../"):
+            normalized_url = "http://" + get_host(parent_url, 2) + url[2:]
         else:
             normalized_url = url
 
         normalized_url = url_normalize(normalized_url)
 
         if normalized_url in self.crawled_pages:
-            return None, True, "page has already been crawled"
+            return normalized_url, True, "page has already been crawled"
 
         logger.debug(f"Normalized url: {normalized_url}")
 
@@ -111,32 +117,34 @@ class Crawler:
         if url == None:
             url = parent_url
 
+        # Normalize URL
         url, should_skip, reason = self.normalize(parent_url, url)
         if should_skip:
             logger.debug(f"Skipping url {url}. Reason: {reason}")
             return
 
-        logger.debug(f"Crawling url: {url}")
-
         # Wait a bit to avoid being blocked
         time.sleep(0.2)
-            
+
+        # Send request
+        logger.debug(f"Crawling url: {url}")
         resp = self.http_pool.request('GET', url)
         self.crawled_pages.append(url)
         logger.debug('Got response: ' + str(resp))
         
         soup = BeautifulSoup(resp.data, 'html.parser')
-        
+
         if self._config.debug:
             self.print_debug(url, soup)
-            
+
+        # Search for child hyperlinks
         links = soup.findAll('a')
         child_urls = [link.attrs.get('href') for link in links
-                      if link.attrs.get('href') != None and
-                      not url.startswith("/") and
-                      not url.startswith("./")
+                      if link.attrs.get('href') != None
         ]
-        
+        # Filter children
+        child_urls = [url for url in child_urls if not url.startswith("#")]
+        # Crawl child hyperlinks
         for child_url in child_urls:
             self.crawl(url, child_url, max_depth=max_depth-1)
 
@@ -144,4 +152,4 @@ class Crawler:
     def run(self):
         with capture_http('crawled_pages.gz'):
             for seed in self.seeds:
-                self.crawl(seed, None, max_depth=10)
+                self.crawl(seed, None, max_depth=2)
