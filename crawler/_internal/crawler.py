@@ -112,7 +112,7 @@ class Crawler:
 
     def crawl(self, parent_url, url, max_depth=10):
         # Fire wall
-        if max_depth == 0:
+        if max_depth == 0 or len(self.crawled_pages) >= self._config.page_limit:
             return
         if url == None:
             url = parent_url
@@ -139,11 +139,12 @@ class Crawler:
 
         # Search for child hyperlinks
         links = soup.findAll('a')
-        child_urls = [link.attrs.get('href') for link in links
-                      if link.attrs.get('href') != None
-        ]
+        child_urls = [link.attrs.get('href') for link in links]
         # Filter children
-        child_urls = [url for url in child_urls if not url.startswith("#")]
+        child_urls = [url for url in child_urls
+                      if url != None and
+                      not url.startswith("#")
+        ]
         # Crawl child hyperlinks
         for child_url in child_urls:
             self.crawl(url, child_url, max_depth=max_depth-1)
