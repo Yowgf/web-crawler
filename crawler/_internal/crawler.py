@@ -1,14 +1,17 @@
 import json
 import multiprocessing as mp # TODO
+from datetime import datetime
 import time
 
 # Crawling libraries
 from bs4 import BeautifulSoup
 from bs4.element import Comment as bs4_comment
+# warcio.capture_http.capture_http must come before the lib that calls http
+# client.
+from warcio.capture_http import capture_http
 import urllib3
 from url_normalize import url_normalize
 from reppy.robots import Robots
-from warcio.capture_http import capture_http
 
 from . import log
 from .utils import get_host
@@ -36,6 +39,8 @@ class Crawler:
             logger.error(f"Error reading seeds file '{seeds_file}': {e}")
             raise
 
+        # TODO: improve efficiency
+
         self._http_pool = urllib3.PoolManager(headers={
             'User-Agent': self._user_agent,
         })
@@ -44,12 +49,19 @@ class Crawler:
         # robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
 
+        # Clean output file
+        open(self._config.output_pages_path, 'w')
+
     # run assumes that Crawler.init has already been called upon the object.
     def run(self):
-        with capture_http('crawled_pages.gz'):
+        before = datetime.now()
+
+        with capture_http(self._config.output_pages_path):
             for seed in self._seeds:
                 self._crawl(seed, None, max_depth=2)
 
+        elapsed = datetime.now() - before
+        logger.info(f"Elapsed time: {elapsed}")
 
     def _is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
