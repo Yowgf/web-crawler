@@ -5,7 +5,6 @@ class Config:
     page_limit_key = 'page_limit'
     debug_key = 'debug'
 
-    crawler_name = "simple-web-crawler/v1.0"
     output_pages_path = "pages.warc.gz"
 
     min_page_limit = 1
@@ -16,8 +15,8 @@ class Config:
         self.page_limit = page_limit
         self.debug = debug
 
-        self.crawler_name = Config.crawler_name
         self.output_pages_path = Config.output_pages_path
+        self.max_workers = 32
 
     def to_json(self):
         def json_mapping(key, val):

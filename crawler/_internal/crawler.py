@@ -1,7 +1,8 @@
 import json
-import multiprocessing as mp # TODO
+import concurrent.futures
 from datetime import datetime
 import time
+from threading import Lock
 
 # Crawling libraries
 from bs4 import BeautifulSoup
@@ -19,16 +20,22 @@ from .utils import get_host
 logger = log.logger()
 
 class Crawler:
+    #
+    # ALL THESE CONSTANTS ARE READ-ONLY.
+    #
+
     _nontext_tags = ['head', 'meta', 'script', 'style', 'title', '[document]']
     _text_tags = ['span', 'div', 'b', 'strong', 'i', 'em', 'mark', 'small']
 
     # Default crawl delay, in seconds
     _default_crawl_delay = 0.2
+    _default_user_agent = "simple-web-crawler/v1.0"
+    _default_http_headers = {
+        'User-Agent': _default_user_agent,
+    }
 
     def __init__(self, config):
         self._config = config
-
-        self._user_agent = self._config.crawler_name
 
     def init(self):
         seeds_file = self._config.seeds_file
@@ -39,15 +46,12 @@ class Crawler:
             logger.error(f"Error reading seeds file '{seeds_file}': {e}")
             raise
 
-        # TODO: improve efficiency
-
-        self._http_pool = urllib3.PoolManager(headers={
-            'User-Agent': self._user_agent,
-        })
-        self._crawled_pages = []
+        self._crawled_pages = set()
+        self._crawled_pages_lock = Lock()
 
         # robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
+        self._robots_cache_lock = Lock()
 
         # Clean output file
         open(self._config.output_pages_path, 'w')
@@ -56,9 +60,43 @@ class Crawler:
     def run(self):
         before = datetime.now()
 
-        with capture_http(self._config.output_pages_path):
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._config.max_workers,
+        ) as executor:
+            results = [[], []]
+            curidx = 0
+
             for seed in self._seeds:
-                self._crawl(seed, None, max_depth=2)
+                http_pool = urllib3.PoolManager(
+                    headers=Crawler._default_http_headers)
+                max_depth = 10
+                results[curidx].append(
+                    executor.submit(
+                        self._crawl, seed, seed, http_pool, max_depth))
+
+            stop_everything = False
+            while not stop_everything:
+                curidx = (curidx + 1) % 2
+
+                for future in concurrent.futures.as_completed(results[curidx]):
+                    parent_url, child_urls, max_depth, stop = future.result()
+                    if stop:
+                        stop_everything = True
+                        break
+
+                    if max_depth == 0:
+                        continue
+
+                    for child_url in child_urls:
+                        http_pool = urllib3.PoolManager(
+                            headers=Crawler._default_http_headers)
+
+                        results[curidx].append(
+                            executor.submit(
+                                self._crawl, parent_url, child_url, http_pool,
+                                max_depth))
+
+                results[curidx] = []
 
         elapsed = datetime.now() - before
         logger.info(f"Elapsed time: {elapsed}")
@@ -115,6 +153,7 @@ class Crawler:
 
         print(json.dumps(debug_json_obj))
 
+    # TODO: check if page has HTML content before crawling.
     def _normalize(self, parent_url, url):
         logger.debug(f"Normalizing url {url} with parent {parent_url}")
 
@@ -143,47 +182,53 @@ class Crawler:
         if crawl_delay == None:
             crawl_delay = self._default_crawl_delay
         return crawl_delay
-        
 
     def _get_crawl_delay(self, normalized_url):
+
         host = get_host(normalized_url)
         if host in self._robots_cache.keys():
             return self._get_crawl_delay_from_policy(self._robots_cache[host])
 
         robots_url = "http://" + get_host(normalized_url) + "/robots.txt"
         robots_resp = Robots.fetch(robots_url)
-        policy = robots_resp.agent(self._user_agent)
+        policy = robots_resp.agent(Crawler._default_user_agent)
 
         # Cache the info
         self._robots_cache[host] = policy
 
         return self._get_crawl_delay_from_policy(policy)
 
-    def _crawl(self, parent_url, url, max_depth=10):
-        # Recursion fire wall
-        if max_depth == 0 or len(self._crawled_pages) >= self._config.page_limit:
-            return
-        if url == None:
-            url = parent_url
+    def _crawl(self, parent_url, url, http_pool, max_depth):
+        with self._crawled_pages_lock:
 
-        # Normalize URL
-        normalized_url, should_skip, reason = self._normalize(parent_url, url)
-        if should_skip:
-            logger.debug(f"Skipping url {normalized_url}. Reason: {reason}")
-            return
+            # Fire wall
+            if len(self._crawled_pages) >= self._config.page_limit:
+                # REQUEST FOR GLOBAL STOP!
+                return None, None, 0, True
+            if max_depth == 0:
+                return None, None, 0, False
+                
+            # Normalize URL
+            normalized_url, should_skip, reason = self._normalize(parent_url, url)
+            if should_skip:
+                logger.debug(f"Skipping url {normalized_url}. Reason: {reason}")
+                return None, None, 0, False
 
+            # Append earlier to make good use of the acquired lock.
+            self._crawled_pages.add(normalized_url)
+
+        # TODO: this won't work with parallel processing. Why?
+        #
         # Wait a bit to avoid being blocked. Must follow policy defined in
         # <host>/robots.txt.
-        crawl_delay = self._get_crawl_delay(normalized_url)
+        with self._robots_cache_lock:
+            crawl_delay = self._get_crawl_delay(normalized_url)
         time.sleep(crawl_delay)
 
         # Send request
         logger.debug(f"Crawling url: {normalized_url}")
-        resp = self._http_pool.request('GET', normalized_url)
+        resp = http_pool.request('GET', normalized_url, timeout=1)
         logger.debug('Got response: ' + str(resp))
-
-        # Register page
-        self._crawled_pages.append(normalized_url)
 
         # Parse page
         soup = BeautifulSoup(resp.data, 'html.parser')
@@ -199,6 +244,5 @@ class Crawler:
                       if (url != None and
                           not url.startswith("#"))
         ]
-        # Crawl child hyperlinks
-        for child_url in child_urls:
-            self._crawl(url, child_url, max_depth=max_depth-1)
+
+        return parent_url, child_urls, max_depth-1, False
