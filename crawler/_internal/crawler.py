@@ -2,7 +2,6 @@ import json
 import concurrent.futures
 from datetime import datetime
 import time
-from threading import Lock
 
 # Crawling libraries
 from bs4 import BeautifulSoup
@@ -15,9 +14,22 @@ from url_normalize import url_normalize
 from reppy.robots import Robots
 
 from . import log
-from .utils import get_host
+from .config import Config
+from .crawl_package import CrawlPackage
+from .crawl_shard import CrawlShard
+from .utils import parse_url
+from .utils import cache_url
+from .utils import cache_urls
+#from .utils import cache_url_packets
+from .utils import DEFAULT_PROTOCOL
+from .utils import is_valid_url
 
 logger = log.logger()
+
+# Overall TODOs:
+#
+# - Use right locale based on website's info
+################################################################################
 
 class Crawler:
     #
@@ -46,12 +58,8 @@ class Crawler:
             logger.error(f"Error reading seeds file '{seeds_file}': {e}")
             raise
 
-        self._crawled_pages = set()
-        self._crawled_pages_lock = Lock()
-
         # robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
-        self._robots_cache_lock = Lock()
 
         # Clean output file
         open(self._config.output_pages_path, 'w')
@@ -64,42 +72,67 @@ class Crawler:
                 max_workers=self._config.max_workers,
         ) as executor:
             results = [[], []]
-            curidx = 0
+            resultsidx = 0
+            def resultsidx_inc(resultsidx):
+                return (resultsidx + 1) % len(results)
+            # TODO: tune the max_depth parameter and make it work.
+            max_depth = 10
+            crawl_package = CrawlPackage()
 
+            # Start with seeds
+            parsed_seeds = {}
             for seed in self._seeds:
-                http_pool = urllib3.PoolManager(
-                    headers=Crawler._default_http_headers)
-                max_depth = 10
-                results[curidx].append(
-                    executor.submit(
-                        self._crawl, seed, seed, http_pool, max_depth))
+                _, host, _ = parse_url(seed)
+                parsed_seeds[host] = [seed]
+            self._register_urls(crawl_package, parsed_seeds)
+            logger.info(f"Submitting jobs for initial seeds {parsed_seeds}")
+            self._submit_jobs(crawl_package, len(self._seeds), executor,
+                              results, resultsidx)
 
-            stop_everything = False
-            while not stop_everything:
-                curidx = (curidx + 1) % 2
+            # Go deeper
+            while True:
+                # Aggregate one run of crawling.
+                crawled_aggr = {}
+                for future in concurrent.futures.as_completed(results[resultsidx]):
+                    host, crawled_normalized_urls = future.result()
+                    cache_urls(crawled_aggr, host, crawled_normalized_urls)
 
-                for future in concurrent.futures.as_completed(results[curidx]):
-                    parent_url, child_urls, max_depth, stop = future.result()
-                    if stop:
-                        stop_everything = True
-                        break
+                    # Go ahead and submit some jobs already, if there are
+                    # any. We shouldn't wait for all threads to complete before
+                    # doing this.
+                    #
+                    # Note that we use the next index of `results`, though. This
+                    # guarantees that results[resultsidx] is a list with
+                    # decreasing length.
+                    self._submit_jobs(crawl_package, 2, executor, results,
+                                      resultsidx_inc(resultsidx))
 
-                    if max_depth == 0:
-                        continue
+                # TODO: stop if necessary
+                if True:
+                    break
 
-                    for child_url in child_urls:
-                        http_pool = urllib3.PoolManager(
-                            headers=Crawler._default_http_headers)
+                self._register_urls(crawl_package, crawled_aggr)
 
-                        results[curidx].append(
-                            executor.submit(
-                                self._crawl, parent_url, child_url, http_pool,
-                                max_depth))
-
-                results[curidx] = []
+                results[resultsidx] = []
+                resultsidx = resultsidx_inc(resultsidx)
 
         elapsed = datetime.now() - before
         logger.info(f"Elapsed time: {elapsed}")
+
+    def _submit_jobs(self, crawl_package, max_njobs, executor, results,
+                     resultsidx):
+        for _ in range(max_njobs):
+            if len(crawl_package.tocrawl) == 0:
+                return
+
+            host, tocrawl = crawl_package.tocrawl.popitem()
+            crawl_delay = self._get_crawl_delay(host)
+            crawl_shard = CrawlShard(host, crawl_delay, tocrawl)
+
+            # Submit job with dedicated HTTP pool
+            http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
+            results[resultsidx].append(executor.submit(self._crawl, crawl_shard,
+                                                       http_pool))
 
     def _is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
@@ -153,29 +186,23 @@ class Crawler:
 
         print(json.dumps(debug_json_obj))
 
-    # TODO: check if page has HTML content before crawling.
-    def _normalize(self, parent_url, url):
-        logger.debug(f"Normalizing url {url} with parent {parent_url}")
+    def _is_url_new(self, crawled, host, url):
+        crawled_pages_in_host = crawled.get(host)
+        if crawled_pages_in_host != None and url in crawled_pages_in_host:
+            return False
+        return True
 
-        normalized_url = None
-
-        if url.startswith("/"):
-            normalized_url = "http://" + get_host(parent_url) + url
-        elif url.startswith("./"):
-            normalized_url = "http://" + get_host(parent_url) + url[1:]
-        elif url.startswith("../"):
-            normalized_url = "http://" + get_host(parent_url, 2) + url[2:]
-        else:
-            normalized_url = url
-
-        normalized_url = url_normalize(normalized_url)
-
-        if normalized_url in self._crawled_pages:
-            return normalized_url, True, "page has already been crawled"
-
-        logger.debug(f"Normalized url: {normalized_url}")
-
-        return normalized_url, False, ""
+    def _register_urls(self, crawl_package, crawled_aggr):
+        logger.debug(f"Registering URLs for aggregated pages: {crawled_aggr}")
+        for host in crawled_aggr:
+            new_urls = []
+            for url in crawled_aggr[host]:
+                if not self._is_url_new(crawl_package.crawled, host, url):
+                    # Oops, not a new URL. Skip
+                    continue
+                new_urls.append(url)
+            cache_urls(crawl_package.crawled, host, new_urls)
+            cache_urls(crawl_package.tocrawl, host, new_urls)
 
     def _get_crawl_delay_from_policy(self, robots_policy):
         crawl_delay = robots_policy.delay
@@ -183,13 +210,11 @@ class Crawler:
             crawl_delay = self._default_crawl_delay
         return crawl_delay
 
-    def _get_crawl_delay(self, normalized_url):
-
-        host = get_host(normalized_url)
-        if host in self._robots_cache.keys():
+    def _get_crawl_delay(self, host):
+        if self._robots_cache.get(host) != None:
             return self._get_crawl_delay_from_policy(self._robots_cache[host])
 
-        robots_url = "http://" + get_host(normalized_url) + "/robots.txt"
+        robots_url = DEFAULT_PROTOCOL + "://" + host + "/robots.txt"
         robots_resp = Robots.fetch(robots_url)
         policy = robots_resp.agent(Crawler._default_user_agent)
 
@@ -198,51 +223,88 @@ class Crawler:
 
         return self._get_crawl_delay_from_policy(policy)
 
-    def _crawl(self, parent_url, url, http_pool, max_depth):
-        with self._crawled_pages_lock:
-
-            # Fire wall
-            if len(self._crawled_pages) >= self._config.page_limit:
-                # REQUEST FOR GLOBAL STOP!
-                return None, None, 0, True
-            if max_depth == 0:
-                return None, None, 0, False
-                
-            # Normalize URL
-            normalized_url, should_skip, reason = self._normalize(parent_url, url)
-            if should_skip:
-                logger.debug(f"Skipping url {normalized_url}. Reason: {reason}")
-                return None, None, 0, False
-
-            # Append earlier to make good use of the acquired lock.
-            self._crawled_pages.add(normalized_url)
-
-        # TODO: this won't work with parallel processing. Why?
-        #
-        # Wait a bit to avoid being blocked. Must follow policy defined in
-        # <host>/robots.txt.
-        with self._robots_cache_lock:
-            crawl_delay = self._get_crawl_delay(normalized_url)
-        time.sleep(crawl_delay)
-
-        # Send request
-        logger.debug(f"Crawling url: {normalized_url}")
-        resp = http_pool.request('GET', normalized_url, timeout=1)
-        logger.debug('Got response: ' + str(resp))
-
-        # Parse page
-        soup = BeautifulSoup(resp.data, 'html.parser')
-
-        if self._config.debug:
-            self._print_debug(normalized_url, soup)
-
-        # Search for child hyperlinks
+    def _find_hrefs(self, soup):
         links = soup.findAll('a')
-        child_urls = [link.attrs.get('href') for link in links]
-        # Filter children
-        child_urls = [url for url in child_urls
-                      if (url != None and
-                          not url.startswith("#"))
-        ]
+        hrefs = [link.attrs.get('href') for link in links]
+        return hrefs
 
-        return parent_url, child_urls, max_depth-1, False
+    # TODO: check if page has HTML content before crawling.
+    #
+    # _get_href_normalized_url transforms an href into a normalized URL,
+    # according to its parent URL. This also works in favor of avoiding page
+    # revisiting.
+    #
+    # If anything is wrong, the function returns a None value.
+    def _get_href_normalized_url(self, parent_url, href):
+        logger.debug(f"Normalizing href {href} with parent {parent_url}")
+
+        # Firewall
+        if href == None or href.startswith('#'):
+            return None
+
+        normalized_url = None
+
+        protocol, host, path_list = parse_url(parent_url)
+
+        if href.startswith("/"):
+            normalized_url = protocol + "://" + host + href
+        elif href.startswith("./"):
+            normalized_url = protocol + "://" + host + "/".join(path_list) + href[1:]
+        elif href.startswith("../"):
+            normalized_url = protocol + "://" + host + "/".join(path_list[:-1]) + href[2:]
+        else:
+            if not is_valid_url(href):
+                # href does not represent a valid URL
+                logger.debug(f"href {href} is invalid URL")
+                return None
+            normalized_url = href
+
+        # Final normalizing step using library function
+        normalized_url = url_normalize(normalized_url)
+
+        logger.debug(f"Normalized url: {normalized_url}")
+
+        return normalized_url
+
+    def _get_href_normalized_urls(self, parent_url, hrefs):
+        normalized_urls = []
+        for href in hrefs:
+            normalized_url = self._get_href_normalized_url(parent_url, href)
+            if normalized_url != None:
+                normalized_urls.append(normalized_url)
+        return normalized_urls
+
+    # TODO: allow each thread to expand into the same host as deep as it can,
+    # with predefined limit.
+    def _crawl(self, crawl_shard, http_pool):
+        logger.debug(f"Received crawl shard to crawl: {crawl_shard.tocrawl}")
+
+        crawled_normalized_urls = []
+
+        for parent_url in crawl_shard.tocrawl:
+            # Send request
+            logger.debug(f"Crawling url: {parent_url}")
+            # TODO: how should we treat timeouts?
+            resp = http_pool.request('GET', parent_url, timeout=1)
+            logger.debug('Got response: ' + str(resp))
+            
+            # Parse page
+            soup = BeautifulSoup(resp.data, 'html.parser')
+            
+            if self._config.debug:
+                self._print_debug(parent_url, soup)
+
+            # Transform hrefs into normalized URLs based on parent
+            hrefs = self._find_hrefs(soup)
+            normalized_child_urls = self._get_href_normalized_urls(parent_url,
+                                                                   hrefs)
+            crawled_normalized_urls.extend(normalized_child_urls)
+
+            # Wait a bit to avoid being blocked. Must follow policy defined in
+            # <host>/robots.txt.
+            #
+            # For this to work, it is assumed that the crawling package the thread
+            # received only contains URLs that refer to one host.
+            time.sleep(crawl_shard.delay)
+            
+        return crawl_shard.host, crawled_normalized_urls
