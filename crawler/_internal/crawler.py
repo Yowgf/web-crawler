@@ -80,22 +80,39 @@ class Crawler:
             crawl_package = CrawlPackage()
 
             # Start with seeds
-            parsed_seeds = {}
             for seed in self._seeds:
                 _, host, _ = parse_url(seed)
-                parsed_seeds[host] = [seed]
-            self._register_urls(crawl_package, parsed_seeds)
-            logger.info(f"Submitting jobs for initial seeds {parsed_seeds}")
+                self._register_urls(crawl_package, host, [], [seed])
+            logger.info(f"Submitting jobs for initial seeds: {crawl_package.tocrawl}")
             self._submit_jobs(crawl_package, len(self._seeds), executor,
                               results, resultsidx)
 
             # Go deeper
-            while True:
+            iteration = 0
+            total_num_crawled = 0
+            stop = False
+            while not stop:
+                logger.info(f"Starting iteration number {iteration}. Results index: {resultsidx}. Number of hosts available for crawling: {len(crawl_package.tocrawl)}")
+
+                # Make sure at least one job is submitted every iteration. This
+                # is specially important in the second iteration (iteration
+                # number 1).
+                self._submit_jobs(crawl_package, 1, executor, results,
+                                  resultsidx_inc(resultsidx))
+
                 # Aggregate one run of crawling.
-                crawled_aggr = {}
                 for future in concurrent.futures.as_completed(results[resultsidx]):
-                    host, crawled_normalized_urls = future.result()
-                    cache_urls(crawled_aggr, host, crawled_normalized_urls)
+                    host, crawled_urls, new_urls = future.result()
+                    total_num_crawled += len(crawled_urls)
+                    if total_num_crawled >= self._config.page_limit:
+                        logger.info(f"Stopping due to page limit. Number of "+
+                                    f"crawled pages: {total_num_crawled}. "+
+                                    f"Page limit: {self._config.page_limit}")
+                        stop = True
+                        break
+
+                    logger.info(f"Found {len(new_urls)} potentially new URLs")
+                    self._register_urls(crawl_package, host, crawled_urls, new_urls)
 
                     # Go ahead and submit some jobs already, if there are
                     # any. We shouldn't wait for all threads to complete before
@@ -104,17 +121,21 @@ class Crawler:
                     # Note that we use the next index of `results`, though. This
                     # guarantees that results[resultsidx] is a list with
                     # decreasing length.
+                    #
+                    # TODO: check if results[resultsidx_inc(resultsidx)] has
+                    # maximum number of jobs before actually proceeding -- this
+                    # can be the max_depth.
                     self._submit_jobs(crawl_package, 2, executor, results,
                                       resultsidx_inc(resultsidx))
 
-                # TODO: stop if necessary
-                if True:
+                if stop:
                     break
-
-                self._register_urls(crawl_package, crawled_aggr)
 
                 results[resultsidx] = []
                 resultsidx = resultsidx_inc(resultsidx)
+                iteration += 1
+
+            self._shutdown_threads(executor, results)
 
         elapsed = datetime.now() - before
         logger.info(f"Elapsed time: {elapsed}")
@@ -133,6 +154,14 @@ class Crawler:
             http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
             results[resultsidx].append(executor.submit(self._crawl, crawl_shard,
                                                        http_pool))
+
+    def _shutdown_threads(self, executor, results):
+        logger.info("Shutting down...")
+        executor.shutdown(wait=False)
+        for result in results:
+            for future in result:
+                future.cancel()
+        logger.info("Shut down.")
 
     def _is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
@@ -192,17 +221,17 @@ class Crawler:
             return False
         return True
 
-    def _register_urls(self, crawl_package, crawled_aggr):
-        logger.debug(f"Registering URLs for aggregated pages: {crawled_aggr}")
-        for host in crawled_aggr:
-            new_urls = []
-            for url in crawled_aggr[host]:
-                if not self._is_url_new(crawl_package.crawled, host, url):
-                    # Oops, not a new URL. Skip
-                    continue
-                new_urls.append(url)
-            cache_urls(crawl_package.crawled, host, new_urls)
-            cache_urls(crawl_package.tocrawl, host, new_urls)
+    def _register_urls(self, crawl_package, host, crawled_urls,
+                       potentially_new_urls):
+        cache_urls(crawl_package.crawled, host, crawled_urls)
+
+        new_urls = []
+        for url in potentially_new_urls:
+            if not self._is_url_new(crawl_package.crawled, host, url):
+                # Not a new URL: skip
+                continue
+            new_urls.append(url)
+        cache_urls(crawl_package.tocrawl, host, new_urls)
 
     def _get_crawl_delay_from_policy(self, robots_policy):
         crawl_delay = robots_policy.delay
@@ -281,30 +310,38 @@ class Crawler:
 
         crawled_normalized_urls = []
 
-        for parent_url in crawl_shard.tocrawl:
-            # Send request
-            logger.debug(f"Crawling url: {parent_url}")
-            # TODO: how should we treat timeouts?
-            resp = http_pool.request('GET', parent_url, timeout=1)
-            logger.debug('Got response: ' + str(resp))
-            
-            # Parse page
-            soup = BeautifulSoup(resp.data, 'html.parser')
-            
-            if self._config.debug:
-                self._print_debug(parent_url, soup)
+        try:
+            for parent_url in crawl_shard.tocrawl:
+                # Send request
+                logger.debug(f"Crawling url: {parent_url}")
+                try:
+                    resp = http_pool.request('GET', parent_url, timeout=1.5)
+                except urllib3.exceptions.MaxRetryError as e:
+                    logger.debug(f"Timeout for parent url {parent_url}: {e}")
+                    continue
+                logger.debug('Got response: ' + str(resp))
+                
+                # Parse page
+                soup = BeautifulSoup(resp.data, 'html.parser')
+                
+                if self._config.debug:
+                    self._print_debug(parent_url, soup)
+                    
+                # Transform hrefs into normalized URLs based on parent
+                hrefs = self._find_hrefs(soup)
+                normalized_child_urls = self._get_href_normalized_urls(parent_url,
+                                                                       hrefs)
+                crawled_normalized_urls.extend(normalized_child_urls)
+                
+                # Wait a bit to avoid being blocked. Must follow policy defined in
+                # <host>/robots.txt.
+                #
+                # For this to work, it is assumed that the crawling package the thread
+                # received only contains URLs that refer to one host.
+                time.sleep(crawl_shard.delay)
+        except Exception as e:
+            logger.error(f"Exception when crawling URL '{parent_url}': {e}",
+                         exc_info=True)
+            return crawl_shard.host, crawl_shard.tocrawl, crawled_normalized_urls
 
-            # Transform hrefs into normalized URLs based on parent
-            hrefs = self._find_hrefs(soup)
-            normalized_child_urls = self._get_href_normalized_urls(parent_url,
-                                                                   hrefs)
-            crawled_normalized_urls.extend(normalized_child_urls)
-
-            # Wait a bit to avoid being blocked. Must follow policy defined in
-            # <host>/robots.txt.
-            #
-            # For this to work, it is assumed that the crawling package the thread
-            # received only contains URLs that refer to one host.
-            time.sleep(crawl_shard.delay)
-            
-        return crawl_shard.host, crawled_normalized_urls
+        return crawl_shard.host, crawl_shard.tocrawl, crawled_normalized_urls

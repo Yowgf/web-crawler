@@ -53,7 +53,7 @@ def parse_config(args):
 
             options[Config.page_limit_key] = page_limit
 
-        elif '-d':
+        elif '-d' == args[arg_idx]:
             options[Config.debug_key] = True
 
     return Config(**options)

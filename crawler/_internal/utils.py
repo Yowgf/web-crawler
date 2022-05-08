@@ -22,18 +22,21 @@ def parse_url(url):
     split_by_protocol = url.split("://")
     if len(split_by_protocol) == 1:
         protocol = ""
-        url_body = split_by_protocol[0]
+        url_body = split_by_protocol[0].split("?")[0]
     else:
         protocol = split_by_protocol[0]
-        url_body = split_by_protocol[1]
+        url_body = split_by_protocol[1].split("?")[0]
     body_split_by_slash = url_body.split("/")
     host = body_split_by_slash[0]
-    path_list = "/".join(body_split_by_slash[1:])
+    # Remove everything after 
+    path_list = body_split_by_slash[1:]
 
     # Remove final '/' if exists, for consistency
     if len(path_list) > 0:
-        if path_list[-1][-1] == '':
+        if path_list[-1] == '':
             path_list.pop()
+        if len(path_list) > 0:
+            path_list = [''] + path_list
 
     return protocol, host, path_list
 
