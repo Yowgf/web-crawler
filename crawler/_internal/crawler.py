@@ -2,6 +2,7 @@ import json
 import concurrent.futures
 from datetime import datetime
 import time
+import unicodedata
 
 # Crawling libraries
 from bs4 import BeautifulSoup
@@ -18,17 +19,21 @@ from .config import Config
 from .crawl_package import CrawlPackage
 from .crawl_shard import CrawlShard
 from .utils import parse_url
-from .utils import cache_url
 from .utils import cache_urls
-#from .utils import cache_url_packets
-from .utils import DEFAULT_PROTOCOL
 from .utils import is_valid_url
+from .utils import CONTENT_TYPE_KEY
+from .utils import DEFAULT_PROTOCOL
+from .utils import SOUP_PARSER
+from .utils import VALID_CONTENT_TYPE
 
 logger = log.logger()
 
 # Overall TODOs:
 #
-# - Use right locale based on website's info
+# - Activate page capturing using WARCIO
+#
+# - Limit number of work given to thread in _submit_jobs, to improve load
+#   balancing.
 ################################################################################
 
 class Crawler:
@@ -75,8 +80,6 @@ class Crawler:
             resultsidx = 0
             def resultsidx_inc(resultsidx):
                 return (resultsidx + 1) % len(results)
-            # TODO: tune the max_depth parameter and make it work.
-            max_depth = 10
             crawl_package = CrawlPackage()
 
             # Start with seeds
@@ -121,12 +124,11 @@ class Crawler:
                     # Note that we use the next index of `results`, though. This
                     # guarantees that results[resultsidx] is a list with
                     # decreasing length.
-                    #
-                    # TODO: check if results[resultsidx_inc(resultsidx)] has
-                    # maximum number of jobs before actually proceeding -- this
-                    # can be the max_depth.
-                    self._submit_jobs(crawl_package, 2, executor, results,
-                                      resultsidx_inc(resultsidx))
+                    if (len(results[resultsidx_inc(resultsidx)]) <
+                        self._config.max_workers * 2
+                    ):
+                        self._submit_jobs(crawl_package, 2, executor, results,
+                                          resultsidx_inc(resultsidx))
 
                 if stop:
                     break
@@ -188,32 +190,32 @@ class Crawler:
     def _find_relevant_text(self, soup):
         texts = soup.findAll(text=True)
         
-        relevant_text = ""
+        relevant_words = []
+        num_relevant_words = 20
         for element in texts:
             if self._is_relevant_text(element):
-                relevant_text = relevant_text + " " + str(element)
-            if len(relevant_text) >= 20:
+                element_str = str(element)
+                while "  " in element_str:
+                    element_str.replace("  ", " ")
+                element_str = element_str.strip()
+                relevant_words.extend(element_str.split(" "))
+
+            if len(relevant_words) >= num_relevant_words:
                 break
 
-        # Trim text
-        relevant_text = relevant_text.strip()
-        while "  " in relevant_text:
-            relevant_text.replace("  ", " ")
-
-        first_20words_relevant_text = str(relevant_text).split(" ")[:20]
-        return " ".join(first_20words_relevant_text)
+        return " ".join(relevant_words[:20])
 
     def _print_debug(self, url, soup):
         debug_json_obj = {}
         debug_json_obj['URL'] = url
-        if soup.title != None:
-            debug_json_obj['Title'] = str(soup.title.string)
+        if soup.title != None and soup.title.string != None:
+            debug_json_obj['Title'] = soup.title.string
         else:
             debug_json_obj['Title'] = ""
         debug_json_obj['Text'] = self._find_relevant_text(soup)
         debug_json_obj['Timestamp'] = int(time.time())
 
-        print(json.dumps(debug_json_obj))
+        print(json.dumps(debug_json_obj, ensure_ascii=False))
 
     def _is_url_new(self, crawled, host, url):
         crawled_pages_in_host = crawled.get(host)
@@ -257,8 +259,6 @@ class Crawler:
         hrefs = [link.attrs.get('href') for link in links]
         return hrefs
 
-    # TODO: check if page has HTML content before crawling.
-    #
     # _get_href_normalized_url transforms an href into a normalized URL,
     # according to its parent URL. This also works in favor of avoiding page
     # revisiting.
@@ -303,8 +303,6 @@ class Crawler:
                 normalized_urls.append(normalized_url)
         return normalized_urls
 
-    # TODO: allow each thread to expand into the same host as deep as it can,
-    # with predefined limit.
     def _crawl(self, crawl_shard, http_pool):
         logger.debug(f"Received crawl shard to crawl: {crawl_shard.tocrawl}")
 
@@ -319,10 +317,17 @@ class Crawler:
                 except urllib3.exceptions.MaxRetryError as e:
                     logger.debug(f"Timeout for parent url {parent_url}: {e}")
                     continue
+
                 logger.debug('Got response: ' + str(resp))
+
+                content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
+                if (content_types == None or
+                    VALID_CONTENT_TYPE not in content_types
+                ):
+                    continue
                 
                 # Parse page
-                soup = BeautifulSoup(resp.data, 'html.parser')
+                soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
                 
                 if self._config.debug:
                     self._print_debug(parent_url, soup)

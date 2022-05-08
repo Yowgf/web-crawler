@@ -1,9 +1,13 @@
 import os
 
+# Read-only global variables
 STATUS_SUCCESS = "SUCCESS"
 STATUS_FAILED = "FAILED"
 VALID_PROTOCOLS = ["http", "https"]
 DEFAULT_PROTOCOL = "http"
+VALID_CONTENT_TYPE = "html"
+SOUP_PARSER = "html.parser"
+CONTENT_TYPE_KEY = "Content-Type"
 
 def file_exists(fpath):
     return os.path.exists(fpath)
@@ -57,29 +61,8 @@ def is_valid_url(url):
         return False
     return True
 
-def cache_url(cache, host, url):
-    if cache.get(host) == None:
-        cache[host] = set(url)
-    else:
-        cache[host].add(url)
-
 def cache_urls(cache, host, urls):
     if cache.get(host) == None:
         cache[host] = set(urls)
     else:
         cache[host] = cache[host].union(urls)
-
-# def cache_url_packet(cache, host, url_packet):
-#     parent_url = url_packet.parent_url
-#     child_url = url_packet.child_url
-#     tup = (parent_url, child_url)
-#     if cache.get(host) == None:
-#         new_set = set()
-#         new_set.add(tup)
-#         cache[host] = new_set
-#     else:
-#         cache[host].add(tup)
-
-# def cache_url_packets(cache, host, url_packets):
-#     for url_packet in url_packets:
-#         cache_url_packet(cache, host, url_packet)
