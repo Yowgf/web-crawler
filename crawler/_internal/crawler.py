@@ -32,6 +32,8 @@ logger = log.logger()
 # Overall TODOs:
 #
 # - Activate page capturing using WARCIO
+#
+# - Limit number of pages to 2500 per host
 ################################################################################
 
 class Crawler:
@@ -165,6 +167,28 @@ class Crawler:
 
             self._shutdown_threads(executor, results)
 
+    def _register_urls(self, crawl_package, host, crawled_urls,
+                       potentially_new_urls):
+        crawl_package.add_urls_crawled(host, crawled_urls)
+
+        # Register the robots.txt policy
+        self._register_robot_policy(host)
+        robots_policy = self._robots_cache.get(host)
+
+        # Arbitrarily chosen threshold of 1000
+        if (crawl_package.total_tocrawl + crawl_package.total_crawled <
+            self._config.page_limit + 1000
+        ):
+            new_urls = []
+            for url in potentially_new_urls:
+                if not self._is_url_new(crawl_package.crawled, host, url):
+                    # Not a new URL: skip
+                    continue
+                elif robots_policy != None and not robots_policy.allowed(url):
+                    continue
+                new_urls.append(url)
+            crawl_package.add_urls_tocrawl(host, new_urls)
+
     def _submit_jobs(self, crawl_package, executor, results,
                      resultsidx):
         if crawl_package.total_tocrawl == 0:
@@ -276,31 +300,15 @@ class Crawler:
             return False
         return True
 
-    def _register_urls(self, crawl_package, host, crawled_urls,
-                       potentially_new_urls):
-        crawl_package.add_urls_crawled(host, crawled_urls)
-
-        # Arbitrarily chosen threshold of 1000
-        if (crawl_package.total_tocrawl + crawl_package.total_crawled <
-            self._config.page_limit + 1000
-        ):
-            new_urls = []
-            for url in potentially_new_urls:
-                if not self._is_url_new(crawl_package.crawled, host, url):
-                    # Not a new URL: skip
-                    continue
-                new_urls.append(url)
-            crawl_package.add_urls_tocrawl(host, new_urls)
-
     def _get_crawl_delay_from_policy(self, robots_policy):
         crawl_delay = robots_policy.delay
         if crawl_delay == None or crawl_delay > self._max_crawl_delay:
             crawl_delay = self._default_crawl_delay
         return crawl_delay
 
-    def _get_crawl_delay(self, host):
+    def _register_robot_policy(self, host):
         if self._robots_cache.get(host) != None:
-            return self._get_crawl_delay_from_policy(self._robots_cache[host])
+            return True
 
         robots_url = DEFAULT_PROTOCOL + "://" + host + "/robots.txt"
         try:
@@ -315,7 +323,14 @@ class Crawler:
         # Cache the info
         self._robots_cache[host] = policy
 
-        return self._get_crawl_delay_from_policy(policy)
+        return True
+
+    def _get_crawl_delay(self, host):
+        success = self._register_robot_policy(host)
+        if success != True:
+            return None
+
+        return self._get_crawl_delay_from_policy(self._robots_cache[host])
 
     def _find_hrefs(self, soup):
         links = soup.findAll('a')
