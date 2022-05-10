@@ -49,20 +49,42 @@ def is_valid_url(url):
         return False
 
     split_by_protocol = url.split("://")
-    if len(split_by_protocol) < 2:
-        return False
-    else:
-        if split_by_protocol[0] not in VALID_PROTOCOLS:
+    if (len(split_by_protocol) >= 2 and
+        split_by_protocol[0] not in VALID_PROTOCOLS
+    ):
             return False
-    split_by_slash = split_by_protocol[1].split('/')
+    elif len(split_by_protocol) == 1:
+        split_by_slash = split_by_protocol[0].split('/')
+    else:
+        split_by_slash = split_by_protocol[1].split('/')
     url_body = split_by_slash[0]
     domains = url_body.split('.')
     if len(domains) < 2:
         return False
+
     return True
 
 def cache_urls(cache, host, urls):
     if cache.get(host) == None:
-        cache[host] = set(urls)
+        cache[host] = urls
     else:
-        cache[host] = cache[host].union(urls)
+        cache[host] = cache[host].extend(urls)
+
+# This class' implementation was obtained from stack overflow:
+#
+# https://stackoverflow.com/questions/11195140/break-or-exit-out-of-with-statement
+class fragile_with(object):
+    class Break(Exception):
+      """Break out of the with statement"""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self.value.__enter__()
+
+    def __exit__(self, etype, value, traceback):
+        error = self.value.__exit__(etype, value, traceback)
+        if etype == self.Break:
+            return True
+        return error

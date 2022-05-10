@@ -28,7 +28,7 @@ def main():
 
         logger.info("Starting crawler run.")
 
-        success_message = crawler.run()
+        success_message = crawler.run_timed()
 
         logger.info("Crawler ran successfully.")
 

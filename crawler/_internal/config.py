@@ -16,7 +16,6 @@ class Config:
         self.debug = debug
 
         self.output_pages_path = Config.output_pages_path
-        self.max_workers = 32
 
     def to_json(self):
         def json_mapping(key, val):
