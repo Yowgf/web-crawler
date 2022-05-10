@@ -21,6 +21,7 @@ from .config import Config
 from .crawl_package import CrawlPackage
 from .crawl_shard import CrawlShard
 from .utils import is_valid_url
+from .utils import len_two_dicts_entry
 from .utils import parse_url
 from .utils import CONTENT_TYPE_KEY
 from .utils import DEFAULT_PROTOCOL
@@ -32,8 +33,6 @@ logger = log.logger()
 # Overall TODOs:
 #
 # - Activate page capturing using WARCIO
-#
-# - Limit number of pages to 2500 per host
 ################################################################################
 
 class Crawler:
@@ -60,6 +59,10 @@ class Crawler:
 
     _max_workers = 32
     _max_njobs = _max_workers * 10
+
+    _max_urls_per_host = 2500
+
+    _page_limit_overflow_allowed = 5000
 
     def __init__(self, config):
         # _robots_cache is a map host -> parsed robots.txt file.
@@ -171,23 +174,30 @@ class Crawler:
                        potentially_new_urls):
         crawl_package.add_urls_crawled(host, crawled_urls)
 
+        if (len_two_dicts_entry(crawl_package.crawled,
+                                crawl_package.tocrawl, host) > 
+            self._max_urls_per_host
+        ):
+            return  
+
+        if (crawl_package.total_tocrawl + crawl_package.total_crawled >=
+            self._config.page_limit + self._page_limit_overflow_allowed
+        ):
+            return
+
         # Register the robots.txt policy
         self._register_robot_policy(host)
         robots_policy = self._robots_cache.get(host)
-
-        # Arbitrarily chosen threshold of 1000
-        if (crawl_package.total_tocrawl + crawl_package.total_crawled <
-            self._config.page_limit + 1000
-        ):
-            new_urls = []
-            for url in potentially_new_urls:
-                if not self._is_url_new(crawl_package.crawled, host, url):
-                    # Not a new URL: skip
-                    continue
-                elif robots_policy != None and not robots_policy.allowed(url):
-                    continue
-                new_urls.append(url)
-            crawl_package.add_urls_tocrawl(host, new_urls)
+        
+        new_urls = []
+        for url in potentially_new_urls:
+            if not self._is_url_new(crawl_package.crawled, host, url):
+                # Not a new URL: skip
+                continue
+            elif robots_policy != None and not robots_policy.allowed(url):
+                continue
+            new_urls.append(url)
+        crawl_package.add_urls_tocrawl(host, new_urls)
 
     def _submit_jobs(self, crawl_package, executor, results,
                      resultsidx):
