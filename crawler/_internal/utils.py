@@ -5,8 +5,10 @@ import sys
 # Read-only global variables
 STATUS_SUCCESS = "SUCCESS"
 STATUS_FAILED = "FAILED"
-VALID_PROTOCOLS = ["http", "https"]
-DEFAULT_PROTOCOL = "http"
+HTTP_SCHEME = "http"
+HTTPS_SCHEME = "https"
+VALID_PROTOCOLS = [HTTP_SCHEME, HTTPS_SCHEME]
+DEFAULT_PROTOCOL = HTTP_SCHEME
 VALID_CONTENT_TYPE = "html"
 SOUP_PARSER = "html.parser"
 CONTENT_TYPE_KEY = "Content-Type"

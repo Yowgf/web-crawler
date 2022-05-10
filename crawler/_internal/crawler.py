@@ -5,6 +5,7 @@ from datetime import datetime
 import glob
 import gzip
 import shutil
+import socket
 import os
 from threading import get_native_id
 import time
@@ -31,12 +32,13 @@ from . import log
 from .config import Config
 from .crawl_package import CrawlPackage
 from .crawl_shard import CrawlShard
+from .robots import FakeRobotsPolicy
 from .utils import is_valid_url
 from .utils import len_two_dicts_entry
 from .utils import parse_url
 from .utils import suppress_output
 from .utils import CONTENT_TYPE_KEY
-from .utils import DEFAULT_PROTOCOL
+from .utils import HTTP_SCHEME, HTTPS_SCHEME
 from .utils import SOUP_PARSER
 from .utils import VALID_CONTENT_TYPE
 
@@ -67,11 +69,13 @@ class Crawler:
     _max_workers = 32
     _max_njobs = _max_workers * 10
 
-    _max_urls_per_host = 2500
+    _max_urls_per_host = 1000
 
     _page_limit_overflow_allowed = 5000
 
     def __init__(self, config):
+        self._config = config
+
         # _robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
 
@@ -79,11 +83,15 @@ class Crawler:
         # crawled by some thread.
         self._active_hosts = set()
 
+        # _unreachable_hosts is a set of hosts for which DNS probing failed. We
+        # don't want to keep retrying on these.
+        self._unreachable_hosts = set()
+
         # _crawl_package is the main global source of information of which pages
         # have already been crawled, and which pages have yet to be crawled.
         self._crawl_package = CrawlPackage()
 
-        self._config = config
+        self._default_robots_policy = FakeRobotsPolicy(self._max_crawl_delay)
 
     # init contains initialization procedures that may throw an exception or
     # otherwise fail.
@@ -125,9 +133,8 @@ class Crawler:
                 return True
 
             # Start with seeds
-            for seed in self._seeds:
-                _, host, _ = parse_url(seed)
-                self._register_urls(self._crawl_package, host, [], [seed])
+            tocrawl = self._get_tocrawl(self._seeds)
+            self._register_urls(self._crawl_package, {}, tocrawl)
             logger.info(f"Submitting jobs for initial seeds: "+
                         f"{self._crawl_package.tocrawl}")
             self._submit_jobs(self._crawl_package, executor, results,
@@ -166,12 +173,9 @@ class Crawler:
                                  f"{len(results[resultsidx])} results left to "+
                                  f"wait for.")
 
-                    self._submit_jobs(self._crawl_package, executor, results,
-                                      increment(resultsidx))
-
                     completed, not_completed = concurrent.futures.wait(
                         results[resultsidx],
-                        timeout=1,
+                        timeout=3,
                         return_when=concurrent.futures.FIRST_COMPLETED,
                     )
                     results[resultsidx] = list(not_completed)
@@ -179,41 +183,15 @@ class Crawler:
                     for future in completed:
                         self._process_complete_future(self._crawl_package, future)
 
+                    self._submit_jobs(self._crawl_package, executor, results,
+                                      increment(resultsidx))
+
                 resultsidx = increment(resultsidx)
                 iteration += 1
 
             self._shutdown_threads(executor, results)
 
         self._aggregate_pages()
-
-    def _register_urls(self, crawl_package, host, crawled_urls,
-                       potentially_new_urls):
-        crawl_package.add_urls_crawled(host, crawled_urls)
-
-        if (len_two_dicts_entry(crawl_package.crawled,
-                                crawl_package.tocrawl, host) > 
-            self._max_urls_per_host
-        ):
-            return  
-
-        if (crawl_package.total_tocrawl + crawl_package.total_crawled >=
-            self._config.page_limit + self._page_limit_overflow_allowed
-        ):
-            return
-
-        # Register the robots.txt policy
-        self._register_robot_policy(host)
-        robots_policy = self._robots_cache.get(host)
-        
-        new_urls = []
-        for url in potentially_new_urls:
-            if not self._is_url_new(crawl_package.crawled, host, url):
-                # Not a new URL: skip
-                continue
-            elif robots_policy != None and not robots_policy.allowed(url):
-                continue
-            new_urls.append(url)
-        crawl_package.add_urls_tocrawl(host, new_urls)
 
     def _submit_jobs(self, crawl_package, executor, results,
                      resultsidx):
@@ -223,7 +201,7 @@ class Crawler:
         tocrawl = {}
         crawl_delays = {}
         for host in list(crawl_package.tocrawl.keys()):
-            if len(results[resultsidx]) >= self._max_njobs:
+            if len(results[resultsidx]) + len(tocrawl) >= self._max_njobs:
                 break
 
             # This condition is what ensures that we will not act over the same
@@ -237,17 +215,17 @@ class Crawler:
 
                 # Add to list of urls to crawl
                 new_urls = []
-                self._active_hosts.add(host)
                 for _ in range(self._max_urls_per_job):
                     if (crawl_package.tocrawl[host] == None or
                         len(crawl_package.tocrawl[host]) == 0
                     ):
                         crawl_package.remove_tocrawl(host)
                         break
-                    new_url = crawl_package.remove_tocrawl_url(host)
+                    new_url = crawl_package.pop_tocrawl(host)
                     new_urls.append(new_url)
                 if len(new_urls) > 0:
                     tocrawl[host] = new_urls
+                    self._active_hosts.add(host)
 
         for host in tocrawl:
             crawl_shard = CrawlShard(host, crawl_delays[host], tocrawl[host])
@@ -267,10 +245,61 @@ class Crawler:
             return
         
         self._active_hosts.remove(host)
-            
+
+        tocrawl = self._get_tocrawl(new_urls)
+
         logger.info(f"Found {len(new_urls)} potentially new URLs")
-        self._register_urls(crawl_package, host, crawled_urls, new_urls)
-            
+        self._register_urls(crawl_package, {host: crawled_urls}, tocrawl)
+
+    # _get_tocrawl separates the urls into different hosts to form a dict
+    # host->url.
+    def _get_tocrawl(self, urls):
+        tocrawl = {}
+        for url in urls:
+            _, host, _ = parse_url(url)
+            if not tocrawl.get(host):
+                tocrawl[host] = []
+            tocrawl[host].append(url)
+        return tocrawl
+
+    def _register_urls(self, crawl_package, recently_crawled,
+                       potentially_new_tocrawl):
+        for host in recently_crawled:
+            crawl_package.add_urls_crawled(host, recently_crawled[host])
+
+        if (crawl_package.total_tocrawl + crawl_package.total_crawled >=
+            self._config.page_limit + self._page_limit_overflow_allowed
+        ):
+            return
+
+        for host in potentially_new_tocrawl:
+            # Check if site can be reached at all. If not, don't bother with
+            # it. This can save many seconds of our life.
+            if self._is_host_unreachable(host):
+                continue
+
+            if (len_two_dicts_entry(crawl_package.crawled,
+                                    crawl_package.tocrawl, host) > 
+                self._max_urls_per_host
+            ):
+                # Skip this host
+                continue
+
+            # Register the robots.txt policy
+            self._register_robot_policy(host)
+            robots_policy = self._robots_cache.get(host)
+
+            potentially_new_urls = potentially_new_tocrawl[host]
+            new_urls = []
+            for url in potentially_new_urls:
+                if not self._is_url_new(crawl_package.crawled, host, url):
+                    # Not a new URL: skip
+                    continue
+                elif robots_policy != None and not robots_policy.allowed(url):
+                    continue
+                new_urls.append(url)
+            crawl_package.add_urls_tocrawl(host, new_urls)
+
     def _shutdown_threads(self, executor, results):
         logger.info("Shutting down...")
         executor.shutdown(wait=False)
@@ -303,6 +332,24 @@ class Crawler:
         # Clean output files
         for fpath in glob.glob("*_" + self._config.output_pages_path):
             os.remove(fpath)
+
+    def _is_host_unreachable(self, host):
+        if host in self._unreachable_hosts:
+            return True
+        try:
+            socket.getaddrinfo(host, 80)
+        except socket.gaierror:
+            self._unreachable_hosts.add(host)
+            return True
+        except:
+            try:
+                socket.getaddrinfo(host, 443)
+            except socket.gaierror:
+                self._unreachable_hosts.add(host)
+                return True
+            except:
+                return False
+        return False
 
     def _is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
@@ -362,14 +409,24 @@ class Crawler:
         if self._robots_cache.get(host) != None:
             return True
 
-        robots_url = DEFAULT_PROTOCOL + "://" + host + "/robots.txt"
         try:
+            robots_url = HTTP_SCHEME + "://" + host + "/robots.txt"
             robots_resp = Robots.fetch(robots_url)
         except requests.Timeout as e:
+            robots_url = HTTPS_SCHEME + "://" + host + "/robots.txt"
             logger.info(f"Timeout while fetching robots page "+
-                         f"'{robots_url}': {e}", exc_info=True)
+                         f"'{robots_url}': {e}")
             # Indicate that something went wrong by returning None.
             return None
+        except Exception as e:
+            # Wa da heck, something weird goin' on here.
+            logger.info(f"Caught exception while fetching robots page "+
+                         f"'{robots_url}': {e}. Using default robot policy.")
+
+            self._robots_cache[host] = self._default_robots_policy
+
+            return True
+
         policy = robots_resp.agent(Crawler._default_user_agent)
 
         # Cache the info
@@ -410,7 +467,7 @@ class Crawler:
 
         if href == ' ':
             return None
-        elif href == 'javascript:void(0)':
+        elif href.startswith('javascript:'):
             return None
         elif href.startswith("/"):
             normalized_url = protocol + "://" + host + href
@@ -452,6 +509,9 @@ class Crawler:
             resp = http_pool.request('GET', url, timeout=1.5)
         except urllib3.exceptions.MaxRetryError as e:
             logger.info(f"({tid}) Timeout for parent url '{url}': {e}")
+            return None
+        except Exception as e:
+            logger.info(f"({tid}) Error when requesting for '{url}': {e}")
             return None
 
         logger.debug(f'({tid}) Got response status: {resp.status}')

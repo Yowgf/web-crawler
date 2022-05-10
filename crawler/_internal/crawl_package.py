@@ -25,10 +25,10 @@ class CrawlPackage():
             self.total_tocrawl -= len(self.tocrawl[host])
             self.tocrawl.pop(host)
 
-    def remove_crawled_url(self, host):
+    def pop_crawled(self, host):
         self.total_crawled -= 1
         return self.crawled[host].pop()
 
-    def remove_tocrawl_url(self, host):
+    def pop_tocrawl(self, host):
         self.total_tocrawl -= 1
         return self.tocrawl[host].pop()
