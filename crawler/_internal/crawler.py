@@ -34,17 +34,13 @@ from .crawl_shard import CrawlShard
 from .utils import is_valid_url
 from .utils import len_two_dicts_entry
 from .utils import parse_url
+from .utils import suppress_output
 from .utils import CONTENT_TYPE_KEY
 from .utils import DEFAULT_PROTOCOL
 from .utils import SOUP_PARSER
 from .utils import VALID_CONTENT_TYPE
 
 logger = log.logger()
-
-# Overall TODOs:
-#
-# - Activate page capturing using WARCIO
-################################################################################
 
 class Crawler:
     #
@@ -277,32 +273,19 @@ class Crawler:
     def _aggregate_pages(self):
         output_fpath = self._config.output_pages_path
         temp_fpath = "web-crawler-temp.gz"
+        # Empty output files
+        open(output_fpath, 'w')
+        open(temp_fpath, 'w')
 
-        # 500 million bytes
-        max_buf_size = 500_000_000
-        input_fpaths = set(glob.glob("*_" + self._config.output_pages_path))
-        while len(input_fpaths) > 0:
-            buf = bytes()
-            processed_files = []
-            for fpath in input_fpaths:
-                with gzip.open(fpath) as f:
-                    new_content = f.read()
+        for input_fpath in glob.glob("*_" + self._config.output_pages_path):
+            with gzip.open(input_fpath) as fin:
+                with gzip.open(temp_fpath, 'ab') as fout:
+                    shutil.copyfileobj(fin, fout)
 
-                if len(buf) + len(new_content) > max_buf_size:
-                    break
-
-                buf += new_content
-                processed_files.append(fpath)
-
-            for processed_file in processed_files:
-                input_fpaths.remove(processed_file)
-
-            with open(temp_fpath, 'ab') as f:
-                f.write(buf)
-                
-        with open(temp_fpath, 'rb') as fin:
-            with gzip.open(output_fpath, 'wb') as fout:
-                shutil.copyfileobj(fin, fout)
+        # Fix any compression errors
+        rc = Recompressor(temp_fpath, output_fpath, verbose=False)
+        with suppress_output():
+            rc.recompress()
 
         os.remove(temp_fpath)
         self._cleanup_output_files()

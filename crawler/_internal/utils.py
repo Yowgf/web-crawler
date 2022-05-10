@@ -1,4 +1,6 @@
+from contextlib import contextmanager
 import os
+import sys
 
 # Read-only global variables
 STATUS_SUCCESS = "SUCCESS"
@@ -82,6 +84,16 @@ def len_two_dicts_entry(d1, d2, k):
         return len(v2)
     else:
         return 0
+
+@contextmanager
+def suppress_output():
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
 
 # # This class' implementation was obtained from stack overflow:
 # #
