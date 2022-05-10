@@ -1,19 +1,30 @@
-import json
+# Standard libraries
 import concurrent.futures
+import json
 from datetime import datetime
+import glob
+import gzip
+import shutil
+import os
 from threading import get_native_id
 import time
 import unicodedata
 
 # Crawling libraries
-from bs4 import BeautifulSoup
-from bs4.element import Comment as bs4_comment
+#
 # warcio.capture_http.capture_http must come before the lib that calls http
 # client.
 from warcio.capture_http import capture_http
+from warcio.recompressor import Recompressor
+# HTML parsing
+from bs4 import BeautifulSoup
+from bs4.element import Comment as bs4_comment
+# HTTP communication
 import urllib3
-from url_normalize import url_normalize
 import requests
+# URL normalization
+from url_normalize import url_normalize
+# Robots.txt parsing
 from reppy.robots import Robots
 
 from . import log
@@ -89,8 +100,7 @@ class Crawler:
             logger.error(f"Error reading seeds file '{seeds_file}': {e}")
             raise
 
-        # Clean main output file
-        open(self._config.output_pages_path, 'w')
+        self._cleanup_output_files()
 
     def run_timed(self):
         before = datetime.now()
@@ -169,6 +179,8 @@ class Crawler:
                 iteration += 1
 
             self._shutdown_threads(executor, results)
+
+        self._aggregate_pages()
 
     def _register_urls(self, crawl_package, host, crawled_urls,
                        potentially_new_urls):
@@ -261,6 +273,44 @@ class Crawler:
             for future in result:
                 future.cancel()
         logger.info("Shut down.")
+
+    def _aggregate_pages(self):
+        output_fpath = self._config.output_pages_path
+        temp_fpath = "web-crawler-temp.gz"
+
+        # 500 million bytes
+        max_buf_size = 500_000_000
+        input_fpaths = set(glob.glob("*_" + self._config.output_pages_path))
+        while len(input_fpaths) > 0:
+            buf = bytes()
+            processed_files = []
+            for fpath in input_fpaths:
+                with gzip.open(fpath) as f:
+                    new_content = f.read()
+
+                if len(buf) + len(new_content) > max_buf_size:
+                    break
+
+                buf += new_content
+                processed_files.append(fpath)
+
+            for processed_file in processed_files:
+                input_fpaths.remove(processed_file)
+
+            with open(temp_fpath, 'ab') as f:
+                f.write(buf)
+                
+        with open(temp_fpath, 'rb') as fin:
+            with gzip.open(output_fpath, 'wb') as fout:
+                shutil.copyfileobj(fin, fout)
+
+        os.remove(temp_fpath)
+        self._cleanup_output_files()
+
+    def _cleanup_output_files(self):
+        # Clean output files
+        for fpath in glob.glob("*_" + self._config.output_pages_path):
+            os.remove(fpath)
 
     def _is_relevant_text(self, soup_element):
         if soup_element.parent.name in Crawler._nontext_tags:
@@ -404,55 +454,63 @@ class Crawler:
                 normalized_urls.append(normalized_url)
         return normalized_urls
 
+    def _crawl_url(self, tid, http_pool, url):
+        logger.debug(f"({tid}) Crawling url: {url}")
+        try:
+            resp = http_pool.request('GET', url, timeout=1.5)
+        except urllib3.exceptions.MaxRetryError as e:
+            logger.info(f"({tid}) Timeout for parent url '{url}': {e}")
+            return None
+
+        logger.debug(f'({tid}) Got response status: {resp.status}')
+
+        content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
+        if (content_types == None or
+            VALID_CONTENT_TYPE not in content_types
+        ):
+            return None
+
+        soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
+        
+        if self._config.debug:
+            self._print_debug(url, soup)
+
+        # Transform hrefs into normalized URLs based on parent
+        hrefs = self._find_hrefs(soup)
+        normalized_child_urls = self._get_href_normalized_urls(url, hrefs)
+
+        return normalized_child_urls
+
     def _crawl(self, crawl_shard, http_pool):
-        logger.debug(f"({get_native_id()}) Started crawling. Received shard: "+
+        tid = get_native_id()
+        logger.debug(f"({tid}) Started crawling. Received shard: "+
                      f"{crawl_shard.tocrawl}")
 
         crawled_parent_urls = []
         crawled_child_urls = []
 
-        for parent_url in crawl_shard.tocrawl:
-            # Send request
-            logger.debug(f"({get_native_id()}) Crawling url: {parent_url}")
-            try:
-                resp = http_pool.request('GET', parent_url, timeout=1.5)
-            except urllib3.exceptions.MaxRetryError as e:
-                logger.info(f"({get_native_id()}) Timeout for parent url "+
-                            f"'{parent_url}': {e}")
-                continue
-            
-            logger.debug(f'({get_native_id()}) Got response status: '+
-                         f'{resp.status}')
+        out_fpath = str(tid) + "_" + self._config.output_pages_path
+        with capture_http(out_fpath):
+            logger.debug(f"({tid}) Capturing pages to '{out_fpath}'")
 
-            content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
-            if (content_types == None or
-                VALID_CONTENT_TYPE not in content_types
-            ):
-                continue
+            for parent_url in crawl_shard.tocrawl:
+                child_urls = self._crawl_url(tid, http_pool, parent_url)
 
-            # Parse page
-            soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
+                if child_urls == None:
+                    continue
 
-            if self._config.debug:
-                self._print_debug(parent_url, soup)
+                crawled_parent_urls.append(parent_url)
+                crawled_child_urls.extend(child_urls)
                 
-            # Transform hrefs into normalized URLs based on parent
-            hrefs = self._find_hrefs(soup)
-            normalized_child_urls = self._get_href_normalized_urls(
-                parent_url, hrefs)
-            # Register our crawling success.
-            crawled_parent_urls.append(parent_url)
-            crawled_child_urls.extend(normalized_child_urls)
-            
-            # Wait a bit to avoid being blocked. Must follow policy defined
-            # in <host>/robots.txt.
-            #
-            # For this to work, it is assumed that the shard the thread
-            # received contains only URLs for a single host.
-            logger.debug(f"({get_native_id()}) Sleeping crawl delay of "+
-                         f"{crawl_shard.delay} seconds")
-            time.sleep(crawl_shard.delay)
+                # Wait a bit to avoid being blocked. Must follow policy defined
+                # in <host>/robots.txt.
+                #
+                # For this to work, it is assumed that the shard the thread
+                # received contains only URLs for a single host.
+                logger.debug(f"({tid}) Sleeping crawl delay of "+
+                             f"{crawl_shard.delay} seconds")
+                time.sleep(crawl_shard.delay)
 
-        logger.debug(f"({get_native_id()}) Finished crawling.")
+        logger.debug(f"({tid}) Finished crawling.")
 
         return crawl_shard.host, crawled_parent_urls, crawled_child_urls
