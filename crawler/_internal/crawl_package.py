@@ -14,3 +14,21 @@ class CrawlPackage():
     def add_urls_tocrawl(self, host, urls):
         self.total_tocrawl += len(urls)
         cache_urls(self.tocrawl, host, urls)
+
+    def remove_crawled(self, host):
+        if self.crawled.get(host):
+            self.total_crawled -= len(self.crawled[host])
+            self.crawled.pop(host)
+
+    def remove_tocrawl(self, host):
+        if self.tocrawl.get(host):
+            self.total_tocrawl -= len(self.tocrawl[host])
+            self.tocrawl.pop(host)
+
+    def remove_crawled_url(self, host):
+        self.total_crawled -= 1
+        return self.crawled[host].pop()
+
+    def remove_tocrawl_url(self, host):
+        self.total_tocrawl -= 1
+        return self.tocrawl[host].pop()

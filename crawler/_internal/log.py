@@ -21,7 +21,7 @@ def logger():
         for h in logger.handlers:
             logger.removeHandler(h)
         logger.propagate = False
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         logger.addHandler(stream_handler())
 
         all_loggers_map[logger_name] = logger

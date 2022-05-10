@@ -116,8 +116,13 @@ class Crawler:
         ) as executor:
             results = [[], []]
             resultsidx = 0
-            def resultsidx_inc(resultsidx):
+            def increment(resultsidx):
                 return (resultsidx + 1) % len(results)
+            def no_jobs_left():
+                for result in results:
+                    if len(result) > 0:
+                        return False
+                return True
 
             # Start with seeds
             for seed in self._seeds:
@@ -138,6 +143,9 @@ class Crawler:
                     f"{self._crawl_package.total_crawled}. Number of pages "+
                     f"available for crawling: {self._crawl_package.total_tocrawl}."
                 )
+                if no_jobs_left():
+                    logger.info("Stopping crawling: no jobs left.")
+                    break
 
                 if self._crawl_package.total_crawled >= self._config.page_limit:
                     logger.info(f"Stopping due to page limit. Number of "+
@@ -150,7 +158,7 @@ class Crawler:
                 # that the current results[resultsidx] is a list with decreasing
                 # length.
                 self._submit_jobs(self._crawl_package, executor, results,
-                                  resultsidx_inc(resultsidx))
+                                  increment(resultsidx))
 
                 # Aggregate one run of crawling.
                 while len(results[resultsidx]) > 0:
@@ -159,7 +167,7 @@ class Crawler:
                                  f"wait for.")
 
                     self._submit_jobs(self._crawl_package, executor, results,
-                                      resultsidx_inc(resultsidx))
+                                      increment(resultsidx))
 
                     completed, not_completed = concurrent.futures.wait(
                         results[resultsidx],
@@ -171,7 +179,7 @@ class Crawler:
                     for future in completed:
                         self._process_complete_future(self._crawl_package, future)
 
-                resultsidx = resultsidx_inc(resultsidx)
+                resultsidx = increment(resultsidx)
                 iteration += 1
 
             self._shutdown_threads(executor, results)
@@ -228,17 +236,18 @@ class Crawler:
                 crawl_delays[host] = crawl_delay
 
                 # Add to list of urls to crawl
-                tocrawl[host] = []
+                new_urls = []
                 self._active_hosts.add(host)
                 for _ in range(self._max_urls_per_job):
                     if (crawl_package.tocrawl[host] == None or
                         len(crawl_package.tocrawl[host]) == 0
                     ):
-                        crawl_package.tocrawl.pop(host)
+                        crawl_package.remove_tocrawl(host)
                         break
-                    new_url = crawl_package.tocrawl[host].pop()
-                    tocrawl[host].append(new_url)
-                continue
+                    new_url = crawl_package.remove_tocrawl_url(host)
+                    new_urls.append(new_url)
+                if len(new_urls) > 0:
+                    tocrawl[host] = new_urls
 
         for host in tocrawl:
             crawl_shard = CrawlShard(host, crawl_delays[host], tocrawl[host])
