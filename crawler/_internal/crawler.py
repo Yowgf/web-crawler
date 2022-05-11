@@ -7,7 +7,7 @@ import gzip
 import shutil
 import socket
 import os
-from threading import get_native_id
+from threading import get_ident
 import time
 import unicodedata
 
@@ -165,14 +165,11 @@ class Crawler:
 
                 completed, not_completed = concurrent.futures.wait(
                     results,
-                    timeout=3.1,
+                    timeout=1,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 results = list(not_completed)
-                
-                # TODO: Processing completed results takes a long time... So we
-                # scale some job submissions in the middle, so that the master
-                # thread doesn't get stuck here.
+
                 for future in completed:
                     self._process_complete_future(self._crawl_package, future)
 
@@ -543,7 +540,7 @@ class Crawler:
         return normalized_child_urls
 
     def _crawl(self, crawl_shard, http_pool):
-        tid = get_native_id()
+        tid = get_ident()
         logger.debug(f"({tid}) Started crawling. Received shard: "+
                      f"{crawl_shard.tocrawl}")
 
