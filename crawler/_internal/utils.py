@@ -12,6 +12,8 @@ DEFAULT_PROTOCOL = HTTP_SCHEME
 VALID_CONTENT_TYPE = "html"
 SOUP_PARSER = "html.parser"
 CONTENT_TYPE_KEY = "Content-Type"
+ROBOTS_TXT_SUFFIX = "/robots.txt"
+MAX_URL_LENGTH = 2048
 
 def file_exists(fpath):
     return os.path.exists(fpath)
@@ -49,7 +51,7 @@ def parse_url(url):
     return protocol, host, path_list
 
 def is_valid_url(url):
-    if len(url) > 2048:
+    if len(url) > MAX_URL_LENGTH:
         return False
 
     split_by_protocol = url.split("://")
@@ -86,6 +88,9 @@ def len_two_dicts_entry(d1, d2, k):
         return len(v2)
     else:
         return 0
+
+def get_robots_url(scheme, host):
+    return scheme + "://" + host + ROBOTS_TXT_SUFFIX
 
 @contextmanager
 def suppress_output():

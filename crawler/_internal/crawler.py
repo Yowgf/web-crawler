@@ -35,14 +35,21 @@ from .crawl_shard import CrawlShard
 from .robots import FakeRobotsPolicy
 from .utils import is_valid_url
 from .utils import len_two_dicts_entry
+from .utils import get_robots_url
 from .utils import parse_url
 from .utils import suppress_output
 from .utils import CONTENT_TYPE_KEY
 from .utils import HTTP_SCHEME, HTTPS_SCHEME
+from .utils import MAX_URL_LENGTH
 from .utils import SOUP_PARSER
 from .utils import VALID_CONTENT_TYPE
 
 logger = log.logger()
+
+# TODOs:
+#
+# - 
+################################################################################
 
 class Crawler:
     #
@@ -52,26 +59,31 @@ class Crawler:
     _nontext_tags = ['head', 'meta', 'script', 'style', 'title', '[document]']
     _text_tags = ['span', 'div', 'b', 'strong', 'i', 'em', 'mark', 'small']
 
-    # Crawl delay constants, in seconds
-    _default_crawl_delay = 0.2
-    _max_crawl_delay = 2
-
     _default_user_agent = "simple-web-crawler/v1.0"
 
     _default_http_headers = {
         'User-Agent': _default_user_agent,
     }
 
+    # CRAWLING LIMITS
+    #
     # Each thread can only work with this many urls at a time. This avoids
     # having a thread that takes to long to complete its task.
     _max_urls_per_job = 25
-
+    #
     _max_workers = 32
+    #
     _max_njobs = _max_workers * 10
-
+    #
     _max_urls_per_host = 1000
-
+    #
     _page_limit_overflow_allowed = 5000
+    #
+    _default_timeout = 2 # seconds
+
+    # Crawl delay constants, in seconds
+    _default_crawl_delay = 0.2
+    _max_crawl_delay = 2
 
     def __init__(self, config):
         self._config = config
@@ -122,38 +134,28 @@ class Crawler:
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self._max_workers,
         ) as executor:
-            results = [[], []]
-            resultsidx = 0
-            def increment(resultsidx):
-                return (resultsidx + 1) % len(results)
-            def no_jobs_left():
-                for result in results:
-                    if len(result) > 0:
-                        return False
-                return True
+            results = []
 
             # Start with seeds
             tocrawl = self._get_tocrawl(self._seeds)
             self._register_urls(self._crawl_package, {}, tocrawl)
             logger.info(f"Submitting jobs for initial seeds: "+
                         f"{self._crawl_package.tocrawl}")
-            self._submit_jobs(self._crawl_package, executor, results,
-                              resultsidx)
+            self._submit_jobs(self._crawl_package, executor, results)
 
             # Go deeper
             iteration = 0
             while True:
                 logger.info(
                     f"Starting iteration number {iteration}. "+
-                    f"Number of results available: {len(results[resultsidx])}. "+
+                    f"Number of results available: {len(results)}. "+
                     f"Number of crawled pages so far: "+
                     f"{self._crawl_package.total_crawled}. Number of pages "+
                     f"available for crawling: {self._crawl_package.total_tocrawl}."
                 )
-                if no_jobs_left():
+                if len(results) == 0:
                     logger.info("Stopping crawling: no jobs left.")
                     break
-
                 if self._crawl_package.total_crawled >= self._config.page_limit:
                     logger.info(f"Stopping due to page limit. Number of "+
                                 f"crawled pages: "+
@@ -161,47 +163,36 @@ class Crawler:
                                 f"Page limit: {self._config.page_limit}")
                     break
 
-                # Note that we use the next index of `results`. This guarantees
-                # that the current results[resultsidx] is a list with decreasing
-                # length.
-                self._submit_jobs(self._crawl_package, executor, results,
-                                  increment(resultsidx))
+                completed, not_completed = concurrent.futures.wait(
+                    results,
+                    timeout=3.1,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                results = list(not_completed)
+                
+                # TODO: Processing completed results takes a long time... So we
+                # scale some job submissions in the middle, so that the master
+                # thread doesn't get stuck here.
+                for future in completed:
+                    self._process_complete_future(self._crawl_package, future)
 
-                # Aggregate one run of crawling.
-                while len(results[resultsidx]) > 0:
-                    logger.debug(f"In master loop. Still "+
-                                 f"{len(results[resultsidx])} results left to "+
-                                 f"wait for.")
+                self._submit_jobs(self._crawl_package, executor, results)
 
-                    completed, not_completed = concurrent.futures.wait(
-                        results[resultsidx],
-                        timeout=3,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    results[resultsidx] = list(not_completed)
-
-                    for future in completed:
-                        self._process_complete_future(self._crawl_package, future)
-
-                    self._submit_jobs(self._crawl_package, executor, results,
-                                      increment(resultsidx))
-
-                resultsidx = increment(resultsidx)
                 iteration += 1
 
             self._shutdown_threads(executor, results)
 
         self._aggregate_pages()
 
-    def _submit_jobs(self, crawl_package, executor, results,
-                     resultsidx):
+    def _submit_jobs(self, crawl_package, executor, results):
         if crawl_package.total_tocrawl == 0:
             return
 
         tocrawl = {}
         crawl_delays = {}
         for host in list(crawl_package.tocrawl.keys()):
-            if len(results[resultsidx]) + len(tocrawl) >= self._max_njobs:
+            # Very important to have this maximum jobs limit.
+            if len(results) + len(tocrawl) >= self._max_njobs:
                 break
 
             # This condition is what ensures that we will not act over the same
@@ -232,18 +223,22 @@ class Crawler:
 
             # Submit job with dedicated HTTP pool
             http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
-            results[resultsidx].append(executor.submit(self._crawl, crawl_shard,
-                                                       http_pool))
+            results.append(executor.submit(self._crawl, crawl_shard, http_pool))
 
-    # _process_complete_future returns True if the master thread should stop, or
-    # False otherwise.
+    # _process_complete_future takes a completed crawling task and processes
+    # it. It removes the crawled host from the list of active hosts, and
+    # registers the new crawled URLs to be crawled later on.
+    #
+    # The function returns True if the master thread should stop, or False
+    # otherwise.
     def _process_complete_future(self, crawl_package, future):
         try:
             host, crawled_urls, new_urls = future.result()
         except Exception as e:
             logger.error(f"Error retrieving future result: {e}")
+            self._active_hosts.remove(host)
             return
-        
+
         self._active_hosts.remove(host)
 
         tocrawl = self._get_tocrawl(new_urls)
@@ -303,9 +298,8 @@ class Crawler:
     def _shutdown_threads(self, executor, results):
         logger.info("Shutting down...")
         executor.shutdown(wait=False)
-        for result in results:
-            for future in result:
-                future.cancel()
+        for future in results:
+            future.cancel()
         logger.info("Shut down.")
 
     def _aggregate_pages(self):
@@ -405,26 +399,41 @@ class Crawler:
             crawl_delay = self._default_crawl_delay
         return crawl_delay
 
+    def _use_default_robot_policy(self, host):
+        self._robots_cache[host] = self._default_robots_policy
+
     def _register_robot_policy(self, host):
         if self._robots_cache.get(host) != None:
             return True
 
+        # TODO: be more careful with which types of exceptions to catch.
+        #
+        # Try to get robots.txt policy using both HTTP and HTTPS.
+        requests_headers = headers={'timeout': str(self._default_timeout)}
         try:
-            robots_url = HTTP_SCHEME + "://" + host + "/robots.txt"
-            robots_resp = Robots.fetch(robots_url)
+            robots_url = get_robots_url(HTTP_SCHEME, host)
+            robots_resp = Robots.fetch(robots_url, headers=requests_headers)
         except requests.Timeout as e:
-            robots_url = HTTPS_SCHEME + "://" + host + "/robots.txt"
             logger.info(f"Timeout while fetching robots page "+
-                         f"'{robots_url}': {e}")
-            # Indicate that something went wrong by returning None.
-            return None
+                        f"'{robots_url}' with {HTTP_SCHEME}: {e}")
+            try:
+                robots_url = get_robots_url(HTTPS_SCHEME, host)
+                robots_resp = Robots.fetch(robots_url, headers=requests_headers)
+            except requests.Timeout as e:
+                logger.info(f"Timeout while fetching robots page "+
+                            f"'{robots_url}' with {HTTPS_SCHEME}: {e}")
+                # Indicate that something went wrong by returning None. We can
+                # try again later.
+                return None
+            except Exception as e:
+                logger.info(f"Caught exception while fetching robots page "+
+                            f"'{robots_url}': {e}. Using default robot policy.")
+                self._use_default_robot_policy(host)
+                return True
         except Exception as e:
-            # Wa da heck, something weird goin' on here.
             logger.info(f"Caught exception while fetching robots page "+
                          f"'{robots_url}': {e}. Using default robot policy.")
-
-            self._robots_cache[host] = self._default_robots_policy
-
+            self._use_default_robot_policy(host)
             return True
 
         policy = robots_resp.agent(Crawler._default_user_agent)
@@ -482,7 +491,7 @@ class Crawler:
 
         # Final normalizing step using library function
         normalized_url = url_normalize(normalized_url)
-        if len(normalized_url) > 2048:
+        if len(normalized_url) > MAX_URL_LENGTH:
             return None
 
         # This is super verbose. Leave uncommented unless suspicious of a
@@ -506,7 +515,7 @@ class Crawler:
     def _crawl_url(self, tid, http_pool, url):
         logger.debug(f"({tid}) Crawling url: {url}")
         try:
-            resp = http_pool.request('GET', url, timeout=1.5)
+            resp = http_pool.request('GET', url, timeout=self._default_timeout)
         except urllib3.exceptions.MaxRetryError as e:
             logger.info(f"({tid}) Timeout for parent url '{url}': {e}")
             return None
