@@ -31,7 +31,6 @@ from reppy.robots import Robots
 from . import log
 from .config import Config
 from .crawl_package import CrawlPackage
-from .crawl_shard import CrawlShard
 from .robots import FakeRobotsPolicy
 from .utils import is_valid_url
 from .utils import len_two_dicts_entry
@@ -48,7 +47,7 @@ logger = log.logger()
 
 # TODOs:
 #
-# - Simplify concept of 'crawl shard' -- simply use a list of URLs.
+# - 
 ################################################################################
 
 class Crawler:
@@ -211,11 +210,10 @@ class Crawler:
                     self._active_hosts[host] = True
 
         for host in tocrawl:
-            crawl_shard = CrawlShard(host, tocrawl[host])
-
             # Submit job with dedicated HTTP pool
             http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
-            results.append(executor.submit(self._crawl, crawl_shard, http_pool))
+            results.append(executor.submit(self._crawl, host, tocrawl[host],
+                                           http_pool))
 
     # _process_complete_future takes a completed crawling task and processes
     # it. It removes the crawled host from the list of active hosts, and
@@ -532,14 +530,10 @@ class Crawler:
 
         return normalized_child_urls
 
-    def _crawl(self, crawl_shard, http_pool):
+    def _crawl(self, host, parent_urls, http_pool):
         tid = get_ident()
-        logger.debug(f"({tid}) Started crawling. Received shard: "+
-                     f"{crawl_shard.tocrawl}")
-
-        # Only one host per thread
-        host = crawl_shard.host
-        tocrawl = crawl_shard.tocrawl
+        logger.debug(f"({tid}) Started crawling. Received "+
+                     f"host: '{host}', parent_urls: {parent_urls}.")
 
         crawled_parent_urls = []
         crawled_child_urls = []
@@ -549,7 +543,7 @@ class Crawler:
             log.info(f"({tid}) Something went wrong when getting crawl delay. "+
                      f"Returning.")
             # Make sure that these URLs return to the 'to crawl' list.
-            crawled_child_urls.extend(tocrawl)
+            crawled_child_urls.extend(parent_urls)
             return host, [], crawled_child_urls
         robots_policy = self._robots_cache[host]
         crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
@@ -558,7 +552,7 @@ class Crawler:
         with capture_http(out_fpath):
             logger.debug(f"({tid}) Capturing pages to '{out_fpath}'")
 
-            for parent_url in tocrawl:
+            for parent_url in parent_urls:
                 if not robots_policy.allowed(parent_url):
                     continue
 
