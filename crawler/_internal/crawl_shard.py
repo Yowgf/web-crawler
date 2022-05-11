@@ -4,7 +4,6 @@
 # Each shard only refers to a specific host (maybe in the future we can accept
 # more than one?), to avoid thread conflict and IP-blacklisting.
 class CrawlShard:
-    def __init__(self, host, delay, tocrawl):
+    def __init__(self, host, tocrawl):
         self.host = host
-        self.delay = delay
         self.tocrawl = tocrawl
