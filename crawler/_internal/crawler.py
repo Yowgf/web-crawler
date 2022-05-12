@@ -7,6 +7,7 @@ import gzip
 import shutil
 import os
 from threading import get_ident
+from threading import Lock
 import time
 import unicodedata
 
@@ -46,7 +47,7 @@ logger = log.logger()
 
 # TODOs:
 #
-# - 
+# - Use 1000-page sized files, instead of dividing uniformly by thread.
 ################################################################################
 
 class Crawler:
@@ -72,7 +73,7 @@ class Crawler:
     # Maximum number of threads the pool is allowed to spawn
     _max_workers = 32
     # Maximum number of registered jobs, i.e. tasks in the pool at any given time.
-    _max_njobs = _max_workers * 10
+    _max_njobs = _max_workers * 4
     # Max URLs that can be cached for any host, at any given time. This goes to
     # ensure that we can parallelize the crawling well.
     _max_urls_per_host = 250
@@ -87,12 +88,24 @@ class Crawler:
     # Crawl delay constants, in seconds
     _default_crawl_delay = 0.2
     _max_crawl_delay = 2
+    #
+    _warc_file_page_limit = 1000
+    # We let threads work with more files, to avoid ruining the parallelism.
+    _warc_file_page_shard = _max_urls_per_job * 2
 
     def __init__(self, config):
         self._config = config
 
+        # _crawl_package is the main global source of information of which pages
+        # have already been crawled, and which pages have yet to be crawled.
+        self._crawl_package = CrawlPackage()
+
         # _robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
+
+        # _default_robots_policy is used in place of a real robots.txt policy in
+        # case that one is not reachable.
+        self._default_robots_policy = FakeRobotsPolicy(self._max_crawl_delay)
 
         # _active_hosts is a set used to indicate if a host is actively being
         # crawled by some thread.
@@ -103,13 +116,21 @@ class Crawler:
         # don't want to keep retrying, since that will slow us down.
         self._unreachable_hosts = set()
 
-        # _crawl_package is the main global source of information of which pages
-        # have already been crawled, and which pages have yet to be crawled.
-        self._crawl_package = CrawlPackage()
-
-        # _default_robots_policy is used in place of a real robots.txt policy in
-        # case that one is not reachable.
-        self._default_robots_policy = FakeRobotsPolicy(self._max_crawl_delay)
+        # _warc_files is a map <file index> -> <number of pages>. This is used
+        # by the threads to keep track of how many pages there are in a file.
+        self._warc_files = {}
+        # _warc_files_lock should be used to atomically access or modify these
+        # data structures.
+        self._warc_files_lock = Lock()
+        # _free_warc_files is a list of file indexes that a thread can pick up
+        # to export page information.
+        self._free_warc_files = []
+        # _cur_warc_file_idx is the highest index of all
+        self._cur_warc_file_idx = 0
+        # _get_warc_file_name returns an output WARC-format file name, given an
+        # index.
+        self._get_warc_file_name = lambda idx : (
+            str(idx) + "_" + self._config.output_pages_path)
 
     # init contains initialization procedures that may throw an exception or
     # otherwise fail.
@@ -122,7 +143,9 @@ class Crawler:
             logger.error(f"Error reading seeds file '{seeds_file}': {e}")
             raise
 
-        self._cleanup_output_files()
+        # Clean output WARC files
+        for fpath in glob.glob("*_" + self._config.output_pages_path):
+            os.remove(fpath)
 
     def run_timed(self):
         before = datetime.now()
@@ -184,14 +207,24 @@ class Crawler:
                 iteration += 1
 
             self._shutdown_threads(executor, results)
-
-        self._aggregate_pages()
+        self._aggregate_warc_files()
 
     def _submit_jobs(self, crawl_package, executor, results):
         if crawl_package.total_tocrawl == 0:
             return
+        # # Avoid submiting new job if the thread is not going to be able to lock
+        # # a WARC file, anyway. We don't get the lock of the warc_files object
+        # # because this is a read operation, and we don't require that it is
+        # # data-consistent.
+        # self._warc_files_lock.acquire()
+        # elif len(self._free_warc_files) == 0):
+        #     self._warc_files_lock.release()
+        #     return
+        # self._warc_files_lock.release()
 
         tocrawl = {}
+        # TODO: Although not necessary, we could choose the host randomly in the
+        # future to improve load balancing.
         for host in list(crawl_package.tocrawl.keys()):
             # Very important to have this maximum jobs limit.
             if len(results) + len(tocrawl) >= self._max_njobs:
@@ -296,34 +329,49 @@ class Crawler:
 
     def _shutdown_threads(self, executor, results):
         logger.info("Shutting down...")
-        executor.shutdown(wait=False)
-        for future in results:
-            future.cancel()
+        # for i in range(len(results)):
+        #     logger.info(f"Cancelling result number {i}.")
+        #     future.cancel()
+        # # Shutdown MUST come after you have canceled the results!
+        # executor.shutdown(wait=False)
         logger.info("Shut down.")
 
-    def _aggregate_pages(self):
-        output_fpath = self._config.output_pages_path
+    def _aggregate_warc_files(self):
         temp_fpath = "web-crawler-temp.gz"
-        # Empty output files
-        open(output_fpath, 'w')
         open(temp_fpath, 'w')
 
-        for input_fpath in glob.glob("*_" + self._config.output_pages_path):
-            with gzip.open(input_fpath) as fin:
+        pages_in_output = 0
+        output_fpath_idx = 0
+        for fileidx in self._warc_files:
+            logger.info(f"Aggregating file with index {fileidx}.")
+            input_fpath = self._get_warc_file_name(fileidx)
+
+            # Copy to temp
+            with gzip.open(input_fpath, 'rb') as fin:
                 with gzip.open(temp_fpath, 'ab') as fout:
                     shutil.copyfileobj(fin, fout)
 
-        # Fix any compression errors
-        rc = Recompressor(temp_fpath, output_fpath, verbose=False)
-        with suppress_output():
-            rc.recompress()
+            if (pages_in_output >= self._warc_file_page_limit or
+                fileidx == len(self._warc_files) - 1
+            ):
+                output_fpath = (f"aggregated{output_fpath_idx}_" +
+                                self._config.output_pages_path)
+                open(output_fpath, 'w')
+                # Copy from temp to output, fixing any compression errors.
+                rc = Recompressor(temp_fpath, output_fpath, verbose=False)
+                with suppress_output():
+                    rc.recompress()
+                pages_in_output = 0
+                output_fpath_idx += 1
+                # Empty temp file
+                open(temp_fpath, 'w')
 
+            pages_in_output += self._warc_file_page_shard
+
+        # Cleanup
         os.remove(temp_fpath)
-        self._cleanup_output_files()
-
-    def _cleanup_output_files(self):
-        # Clean output files
-        for fpath in glob.glob("*_" + self._config.output_pages_path):
+        for fileidx in self._warc_files:
+            fpath = self._get_warc_file_name(fileidx)
             os.remove(fpath)
 
     def _is_host_unreachable(self, host):
@@ -382,13 +430,14 @@ class Crawler:
     def _use_default_robot_policy(self, host):
         self._robots_cache[host] = self._default_robots_policy
 
-    def _register_robot_policy(self, host):
+    def _register_robot_policy(self, host, tid="Unknown"):
         if self._robots_cache.get(host) != None:
             return True
 
         # TODO: be more careful with which types of exceptions to catch.
         #
         # Try to get robots.txt policy using both HTTP and HTTPS.
+        logger.info(f"({tid}) Registering new robots policy for host {host}")
         requests_headers = headers={'timeout': str(self._default_timeout)}
         try:
             robots_url = get_robots_url(HTTP_SCHEME, host)
@@ -493,6 +542,47 @@ class Crawler:
                 normalized_urls.append(normalized_url)
         return normalized_urls
 
+    def _pop_warc_file(self):
+        self._warc_files_lock.acquire()
+
+        if len(self._free_warc_files) > 0:
+            fileidx = self._free_warc_files.pop()
+            warc_file = self._get_warc_file_name(fileidx)
+            already_crawled = self._warc_files[fileidx]
+        elif (len(self._warc_files) * self._warc_file_page_shard >=
+             self._config.page_limit
+        ):
+            self._warc_files_lock.release()
+            return None, None, None, False
+        else:
+            # Create new entry. The file itself is not created.
+            fileidx = self._cur_warc_file_idx
+            warc_file = self._get_warc_file_name(fileidx)
+            already_crawled = 0
+            # Update global entries. Notice that the file starts as 'not free',
+            # so we don't include it in the free files list.
+            self._warc_files[fileidx] = 0
+            self._cur_warc_file_idx += 1
+
+        logger.debug(f"Locked file '{warc_file}'. Number of free files: "+
+                     f"{len(self._free_warc_files)}")
+        self._warc_files_lock.release()
+        return fileidx, warc_file, already_crawled, True
+
+    def _release_warc_file(self, fileidx, already_crawled):
+        self._warc_files_lock.acquire()
+
+        if already_crawled < self._warc_file_page_shard:
+            # Only add back to free list if not full already.
+            self._free_warc_files.append(fileidx)
+        self._warc_files[fileidx] = already_crawled
+
+        logger.debug(f"Released file '{fileidx}'. Number of free files: "+
+                     f"{len(self._free_warc_files)}")
+
+        self._warc_files_lock.release()
+        return
+
     def _crawl_url(self, tid, http_pool, url):
         logger.debug(f"({tid}) Crawling url: {url}")
         try:
@@ -537,21 +627,38 @@ class Crawler:
         num_failures = 0
 
         try:
+            # This call should properly apply mutual exclusion to avoid data
+            # races.
+            fileidx, warc_file, already_crawled, success = self._pop_warc_file()
+            if success != True:
+                # This may indicate that there are no free files, and the limit
+                # number of files has already been reached.
+                logger.info(f"({tid}) Unable to lock a WARC file. "+
+                            f"Returning with no-op.")
+                crawled_child_urls.extend(parent_urls)
+                return host, 0, [], crawled_child_urls
+
             # Get robots.txt information to avoid being blocked.
-            if self._register_robot_policy(host) == False:
+            if self._register_robot_policy(host, tid=tid) == False:
                 log.info(f"({tid}) Something went wrong when registering robot "+
                          f"policy. Returning with no-op.")
                 # Make sure that these URLs return to the 'to crawl' list.
                 crawled_child_urls.extend(parent_urls)
-                return host, [], crawled_child_urls
+                return host, 0, [], crawled_child_urls
             robots_policy = self._robots_cache[host]
             crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
 
-            out_fpath = str(tid) + "_" + self._config.output_pages_path
-            with capture_http(out_fpath):
-                logger.debug(f"({tid}) Capturing pages to '{out_fpath}'")
-                
+            with capture_http(warc_file):
+                logger.debug(f"({tid}) Capturing pages to '{warc_file}'")
+
                 for parent_url in parent_urls:
+                    if (already_crawled + len(crawled_parent_urls) >=
+                        self._warc_file_page_shard
+                    ):
+                        logger.info(f"({tid}) Reached max number of pages for "+
+                                    "WARC file.")
+                        break
+
                     if not robots_policy.allowed(parent_url):
                         continue
                     
@@ -560,9 +667,11 @@ class Crawler:
                     if child_urls == None:
                         num_failures += 1
                         if num_failures >= self._max_num_failures_unreachable:
+                            logger.info(f"({tid}) Reached max number of failures "+
+                                        f"for host '{host}'.")
                             break
                         continue
-                    
+
                     crawled_parent_urls.append(parent_url)
                     crawled_child_urls.extend(child_urls)
                     
@@ -574,10 +683,17 @@ class Crawler:
                     logger.debug(f"({tid}) Sleeping crawl delay of "+
                                  f"{crawl_delay} seconds")
                     time.sleep(crawl_delay)
+
+            self._release_warc_file(fileidx,
+                                    already_crawled + len(crawled_parent_urls))
         except Exception as e:
             logger.error(f"({tid}) Received uncaught exception while crawling: "+
                          f"{e}. Returning immediately.")
-            # Please return immediately!
+            try:
+                self._release_warc_file(fileidx,
+                                        already_crawled + len(crawled_parent_urls))
+            except:
+                pass
 
         logger.debug(f"({tid}) Finished crawling.")
 

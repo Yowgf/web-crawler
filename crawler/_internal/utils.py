@@ -69,7 +69,7 @@ def is_valid_url(url):
         return False
     # If 'domain' is actually .html for example, we don't want to say this is a
     # valid domain.
-    if domains[-1] in ['html', 'pdf', 'php']:
+    if domains[-1] in ['xml', 'html', 'pdf', 'php']:
         return False
 
     return True
