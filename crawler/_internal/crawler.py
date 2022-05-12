@@ -5,7 +5,6 @@ from datetime import datetime
 import glob
 import gzip
 import shutil
-import socket
 import os
 from threading import get_ident
 import time
@@ -58,8 +57,9 @@ class Crawler:
     _nontext_tags = ['head', 'meta', 'script', 'style', 'title', '[document]']
     _text_tags = ['span', 'div', 'b', 'strong', 'i', 'em', 'mark', 'small']
 
+    # CRAWLER IDENTITY
+    #
     _default_user_agent = "simple-web-crawler/v1.0"
-
     _default_http_headers = {
         'User-Agent': _default_user_agent,
     }
@@ -69,20 +69,21 @@ class Crawler:
     # Each thread can only work with this many urls at a time. This avoids
     # having a thread that takes to long to complete its task.
     _max_urls_per_job = 25
-    #
+    # Maximum number of threads the pool is allowed to spawn
     _max_workers = 32
-    #
+    # Maximum number of registered jobs, i.e. tasks in the pool at any given time.
     _max_njobs = _max_workers * 10
     # Max URLs that can be cached for any host, at any given time. This goes to
     # ensure that we can parallelize the crawling well.
     _max_urls_per_host = 250
-    #
+    # This overflow above the objective number of pages (page_limit) exists so
+    # that we don't run out of pages to crawl.
     _page_limit_overflow_allowed = 100000
-    #
-    _default_timeout = 2 # seconds
-    #
+    # If this number of failures in a single 'batch' a thread takes to process,
+    # the host is considered to be unreachable for the rest of the program.
     _max_num_failures_unreachable = 5
-
+    # Default timeout of a request, in seconds
+    _default_timeout = 2
     # Crawl delay constants, in seconds
     _default_crawl_delay = 0.2
     _max_crawl_delay = 2
@@ -97,19 +98,17 @@ class Crawler:
         # crawled by some thread.
         self._active_hosts = set()
 
-        # # _reachable_hosts is a set of hosts for which DNS probing
-        # # succeeded. This does not guarantee that the host is reachable.
-        # self._reachable_hosts = set()
-
-        # _unreachable_hosts is a set of hosts for which DNS probing failed, or
-        # for which `self._max_num_failures_unreachable` consecutive requests
-        # failed. We don't want to keep retrying, since that will slow us down.
+        # _unreachable_hosts is a set of hosts for which
+        # `self._max_num_failures_unreachable` consecutive requests failed. We
+        # don't want to keep retrying, since that will slow us down.
         self._unreachable_hosts = set()
 
         # _crawl_package is the main global source of information of which pages
         # have already been crawled, and which pages have yet to be crawled.
         self._crawl_package = CrawlPackage()
 
+        # _default_robots_policy is used in place of a real robots.txt policy in
+        # case that one is not reachable.
         self._default_robots_policy = FakeRobotsPolicy(self._max_crawl_delay)
 
     # init contains initialization procedures that may throw an exception or
@@ -330,23 +329,6 @@ class Crawler:
     def _is_host_unreachable(self, host):
         if host in self._unreachable_hosts:
             return True
-        # if host in self._reachable_hosts:
-        #     return False
-
-        # logger.info(f"Checking if {host} is reachable through sockets")
-        # try:
-        #     socket.getaddrinfo(host, 80)
-        # except socket.gaierror:
-        #     self._unreachable_hosts.add(host)
-        #     return True
-        # except:
-        #     try:
-        #         socket.getaddrinfo(host, 443)
-        #     except:
-        #         self._unreachable_hosts.add(host)
-        #         return True
-
-        # self._reachable_hosts.add(host)
         return False
 
     def _is_relevant_text(self, soup_element):
