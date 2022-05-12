@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 import glob
 import gzip
+import random
 import shutil
 import os
 from threading import get_ident
@@ -45,11 +46,6 @@ from .utils import VALID_CONTENT_TYPE
 
 logger = log.logger()
 
-# TODOs:
-#
-# - Use 1000-page sized files, instead of dividing uniformly by thread.
-################################################################################
-
 class Crawler:
     #
     # ALL THESE CONSTANTS ARE READ-ONLY.
@@ -70,10 +66,6 @@ class Crawler:
     # Each thread can only work with this many urls at a time. This avoids
     # having a thread that takes to long to complete its task.
     _max_urls_per_job = 25
-    # Maximum number of threads the pool is allowed to spawn
-    _max_workers = 32
-    # Maximum number of registered jobs, i.e. tasks in the pool at any given time.
-    _max_njobs = _max_workers * 4
     # Max URLs that can be cached for any host, at any given time. This goes to
     # ensure that we can parallelize the crawling well.
     _max_urls_per_host = 250
@@ -95,6 +87,20 @@ class Crawler:
 
     def __init__(self, config):
         self._config = config
+
+        # Maximum number of threads the pool is allowed to spawn
+        self._max_workers = min(
+            (
+                self._config.page_limit //
+                self._warc_file_page_shard
+            ),
+            32
+        )
+        if self._max_workers <= 0:
+            self._max_workers = 1
+        # Maximum number of registered jobs, i.e. tasks in the pool at any given
+        # time.
+        self._max_njobs = self._max_workers * 4
 
         # _crawl_package is the main global source of information of which pages
         # have already been crawled, and which pages have yet to be crawled.
@@ -168,8 +174,6 @@ class Crawler:
             # Start with seeds
             tocrawl = self._get_tocrawl(self._seeds)
             self._register_urls(self._crawl_package, {}, tocrawl)
-            logger.info(f"Submitting jobs for initial seeds: "+
-                        f"{self._crawl_package.tocrawl}")
             self._submit_jobs(self._crawl_package, executor, results)
 
             # Go deeper
@@ -180,7 +184,9 @@ class Crawler:
                     f"Number of results available: {len(results)}. "+
                     f"Number of crawled pages so far: "+
                     f"{self._crawl_package.total_crawled}. Number of pages "+
-                    f"available for crawling: {self._crawl_package.total_tocrawl}."
+                    f"available for crawling: {self._crawl_package.total_tocrawl}. "+
+                    f"Total number of hosts: {len(self._crawl_package.tocrawl)}. "+
+                    f"Number of active hosts: {len(self._active_hosts)}."
                 )
                 if len(results) == 0:
                     logger.info("Stopping crawling: no jobs left.")
@@ -212,40 +218,41 @@ class Crawler:
     def _submit_jobs(self, crawl_package, executor, results):
         if crawl_package.total_tocrawl == 0:
             return
-        # # Avoid submiting new job if the thread is not going to be able to lock
-        # # a WARC file, anyway. We don't get the lock of the warc_files object
-        # # because this is a read operation, and we don't require that it is
-        # # data-consistent.
-        # self._warc_files_lock.acquire()
-        # elif len(self._free_warc_files) == 0):
-        #     self._warc_files_lock.release()
-        #     return
-        # self._warc_files_lock.release()
 
         tocrawl = {}
         # TODO: Although not necessary, we could choose the host randomly in the
         # future to improve load balancing.
-        for host in list(crawl_package.tocrawl.keys()):
+        hosts = list(crawl_package.tocrawl.keys())
+        while True:
             # Very important to have this maximum jobs limit.
             if len(results) + len(tocrawl) >= self._max_njobs:
                 break
+            if len(hosts) == 0:
+                break
+
+            hostidx = random.randint(0, len(hosts)-1)
+            host = hosts.pop(hostidx)
 
             # This condition is what ensures that we will not act over the same
             # host in two different threads!!!
-            if host not in self._active_hosts:
+            if host in self._active_hosts:
+                # There was a previous bug where this was 'break' instead of
+                # 'continue', and so EVERYTHING got messed up...
+                continue
 
-                # Add to list of urls to crawl
-                new_urls = []
-                for _ in range(self._max_urls_per_job):
-                    if (crawl_package.tocrawl[host] == None or
-                        len(crawl_package.tocrawl[host]) == 0
-                    ):
-                        crawl_package.remove_tocrawl(host)
-                        break
-                    new_url = crawl_package.pop_tocrawl(host)
-                    new_urls.append(new_url)
-                if len(new_urls) > 0:
-                    tocrawl[host] = new_urls
+            # Add to list of urls to crawl for that host.
+            new_urls = []
+            for _ in range(self._max_urls_per_job):
+                if (crawl_package.tocrawl[host] == None or
+                    len(crawl_package.tocrawl[host]) == 0
+                ):
+                    # logger.info(f"Breaking D. Host: {host}. Length new_urls: {len(new_urls)}. crawl_package.tocrawl[host] = {crawl_package.tocrawl[host]}")
+                    crawl_package.remove_tocrawl(host)
+                    break
+                new_url = crawl_package.pop_tocrawl(host)
+                new_urls.append(new_url)
+            if len(new_urls) > 0:
+                tocrawl[host] = new_urls
 
         for host in tocrawl:
             # Submit job with dedicated HTTP pool
@@ -280,7 +287,7 @@ class Crawler:
         tocrawl = {}
         for url in urls:
             _, host, _ = parse_url(url)
-            if not tocrawl.get(host):
+            if tocrawl.get(host) == None:
                 tocrawl[host] = []
             tocrawl[host].append(url)
         return tocrawl
@@ -318,14 +325,16 @@ class Crawler:
             potentially_new_urls = potentially_new_tocrawl[host]
             new_urls = []
             for url in potentially_new_urls:
-                if not self._is_url_new(crawl_package.crawled, host, url):
-                    # Not a new URL: skip
+                if url in new_urls:
+                    continue
+                elif not self._is_url_new(crawl_package.crawled, host, url):
                     continue
                 elif robots_policy != None and not robots_policy.allowed(url):
                     # Avoid overhead by not including disallowed URLs here.
                     continue
                 new_urls.append(url)
-            crawl_package.add_urls_tocrawl(host, new_urls)
+            if len(new_urls) > 0:
+                crawl_package.add_urls_tocrawl(host, new_urls)
 
     def _shutdown_threads(self, executor, results):
         logger.info("Shutting down...")
@@ -337,6 +346,9 @@ class Crawler:
         logger.info("Shut down.")
 
     def _aggregate_warc_files(self):
+        logger.info(f"Aggregating WARC files into chunks of size "+
+                    f"{self._warc_file_page_limit}.")
+
         temp_fpath = "web-crawler-temp.gz"
         open(temp_fpath, 'w')
 
@@ -369,10 +381,13 @@ class Crawler:
             pages_in_output += self._warc_file_page_shard
 
         # Cleanup
+        logger.info("Cleaning up temporary files.")
         os.remove(temp_fpath)
         for fileidx in self._warc_files:
             fpath = self._get_warc_file_name(fileidx)
             os.remove(fpath)
+
+        logger.info("Done aggregating WARC files.")
 
     def _is_host_unreachable(self, host):
         if host in self._unreachable_hosts:
@@ -506,7 +521,10 @@ class Crawler:
 
         if href == ' ':
             return None
-        elif href.startswith('javascript:') or href.startswith('mailto:'):
+        elif (href.startswith('javascript:') or
+              href.startswith('mailto:') or
+              href.startswith('tel:')
+        ):
             return None
         elif href.startswith("/"):
             normalized_url = protocol + "://" + host + href
@@ -583,6 +601,11 @@ class Crawler:
         self._warc_files_lock.release()
         return
 
+    def _filter_bad_requests(self, req, resp, req_recorder):
+        if resp.http_headers.get_statuscode() != '200':
+            return None, None
+        return req, resp
+
     def _crawl_url(self, tid, http_pool, url):
         logger.debug(f"({tid}) Crawling url: {url}")
         try:
@@ -637,6 +660,7 @@ class Crawler:
                             f"Returning with no-op.")
                 crawled_child_urls.extend(parent_urls)
                 return host, 0, [], crawled_child_urls
+            logger.debug(f"({tid}) Capturing pages to '{warc_file}'")
 
             # Get robots.txt information to avoid being blocked.
             if self._register_robot_policy(host, tid=tid) == False:
@@ -648,9 +672,7 @@ class Crawler:
             robots_policy = self._robots_cache[host]
             crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
 
-            with capture_http(warc_file):
-                logger.debug(f"({tid}) Capturing pages to '{warc_file}'")
-
+            with capture_http(warc_file, self._filter_bad_requests):
                 for parent_url in parent_urls:
                     if (already_crawled + len(crawled_parent_urls) >=
                         self._warc_file_page_shard
@@ -658,12 +680,12 @@ class Crawler:
                         logger.info(f"({tid}) Reached max number of pages for "+
                                     "WARC file.")
                         break
-
+                    
                     if not robots_policy.allowed(parent_url):
                         continue
-                    
+
                     child_urls = self._crawl_url(tid, http_pool, parent_url)
-                    
+
                     if child_urls == None:
                         num_failures += 1
                         if num_failures >= self._max_num_failures_unreachable:
@@ -671,7 +693,7 @@ class Crawler:
                                         f"for host '{host}'.")
                             break
                         continue
-
+                    
                     crawled_parent_urls.append(parent_url)
                     crawled_child_urls.extend(child_urls)
                     

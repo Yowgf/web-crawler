@@ -76,9 +76,8 @@ def is_valid_url(url):
 
 def cache_urls(cache, host, urls):
     if cache.get(host) == None:
-        cache[host] = urls
-    else:
-        cache[host] = cache[host].extend(urls)
+        cache[host] = []
+    cache[host].extend(urls)
 
 def len_two_dicts_entry(d1, d2, k):
     v1 = d1.get(k)
