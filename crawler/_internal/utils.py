@@ -8,7 +8,7 @@ STATUS_FAILED = "FAILED"
 HTTP_SCHEME = "http"
 HTTPS_SCHEME = "https"
 VALID_PROTOCOLS = [HTTP_SCHEME, HTTPS_SCHEME]
-DEFAULT_PROTOCOL = HTTP_SCHEME
+DEFAULT_PROTOCOL = HTTPS_SCHEME
 VALID_CONTENT_TYPE = "html"
 SOUP_PARSER = "html.parser"
 CONTENT_TYPE_KEY = "Content-Type"
@@ -31,7 +31,7 @@ def between(n, left, right):
 def parse_url(url):
     split_by_protocol = url.split("://")
     if len(split_by_protocol) == 1:
-        protocol = ""
+        protocol = DEFAULT_PROTOCOL
         url_body = split_by_protocol[0].split("?")[0]
     else:
         protocol = split_by_protocol[0]
@@ -66,6 +66,10 @@ def is_valid_url(url):
     url_body = split_by_slash[0]
     domains = url_body.split('.')
     if len(domains) < 2:
+        return False
+    # If 'domain' is actually .html for example, we don't want to say this is a
+    # valid domain.
+    if domains[-1] in ['html', 'pdf', 'php']:
         return False
 
     return True

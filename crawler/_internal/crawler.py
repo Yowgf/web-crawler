@@ -73,12 +73,15 @@ class Crawler:
     _max_workers = 32
     #
     _max_njobs = _max_workers * 10
+    # Max URLs that can be cached for any host, at any given time. This goes to
+    # ensure that we can parallelize the crawling well.
+    _max_urls_per_host = 250
     #
-    _max_urls_per_host = 1000
-    #
-    _page_limit_overflow_allowed = 5000
+    _page_limit_overflow_allowed = 100000
     #
     _default_timeout = 2 # seconds
+    #
+    _max_num_failures_unreachable = 5
 
     # Crawl delay constants, in seconds
     _default_crawl_delay = 0.2
@@ -90,13 +93,17 @@ class Crawler:
         # _robots_cache is a map host -> parsed robots.txt file.
         self._robots_cache = {}
 
-        # _active_hosts is a map used to indicate if a host is actively being
-        # crawled by some thread. If host A is active, then A -> True, otherwise
-        # A -> False.
-        self._active_hosts = {}
+        # _active_hosts is a set used to indicate if a host is actively being
+        # crawled by some thread.
+        self._active_hosts = set()
 
-        # _unreachable_hosts is a set of hosts for which DNS probing failed. We
-        # don't want to keep retrying on these.
+        # # _reachable_hosts is a set of hosts for which DNS probing
+        # # succeeded. This does not guarantee that the host is reachable.
+        # self._reachable_hosts = set()
+
+        # _unreachable_hosts is a set of hosts for which DNS probing failed, or
+        # for which `self._max_num_failures_unreachable` consecutive requests
+        # failed. We don't want to keep retrying, since that will slow us down.
         self._unreachable_hosts = set()
 
         # _crawl_package is the main global source of information of which pages
@@ -207,13 +214,13 @@ class Crawler:
                     new_urls.append(new_url)
                 if len(new_urls) > 0:
                     tocrawl[host] = new_urls
-                    self._active_hosts[host] = True
 
         for host in tocrawl:
             # Submit job with dedicated HTTP pool
             http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
             results.append(executor.submit(self._crawl, host, tocrawl[host],
                                            http_pool))
+            self._active_hosts.add(host)
 
     # _process_complete_future takes a completed crawling task and processes
     # it. It removes the crawled host from the list of active hosts, and
@@ -222,15 +229,13 @@ class Crawler:
     # The function returns True if the master thread should stop, or False
     # otherwise.
     def _process_complete_future(self, crawl_package, future):
-        try:
-            host, crawled_urls, new_urls = future.result()
-        except Exception as e:
-            logger.error(f"Error retrieving future result: {e}")
-            return
+        # .result() doesn't throw exceptions.
+        host, num_failures, crawled_urls, new_urls = future.result()
 
-        for host in list(self._active_hosts.keys()):
-            if self._active_hosts[host] == False:
-                self._active_hosts.pop(host)
+        if num_failures >= self._max_num_failures_unreachable:
+            self._crawl_package.remove_tocrawl(host)
+            self._unreachable_hosts.add(host)
+        self._active_hosts.remove(host)
 
         tocrawl = self._get_tocrawl(new_urls)
 
@@ -266,16 +271,16 @@ class Crawler:
                 # here.
                 self._robots_cache[host] = None
 
-            # Check if site can be reached at all. If not, don't bother with
-            # it. This can save many seconds of our life.
-            if self._is_host_unreachable(host):
-                continue
-
             if (len_two_dicts_entry(crawl_package.crawled,
                                     crawl_package.tocrawl, host) > 
                 self._max_urls_per_host
             ):
                 # Skip this host
+                continue
+
+            # Check if site can be reached at all. If not, don't bother with
+            # it. This can save many seconds of our life.
+            if self._is_host_unreachable(host):
                 continue
 
             potentially_new_urls = potentially_new_tocrawl[host]
@@ -325,19 +330,23 @@ class Crawler:
     def _is_host_unreachable(self, host):
         if host in self._unreachable_hosts:
             return True
-        try:
-            socket.getaddrinfo(host, 80)
-        except socket.gaierror:
-            self._unreachable_hosts.add(host)
-            return True
-        except:
-            try:
-                socket.getaddrinfo(host, 443)
-            except socket.gaierror:
-                self._unreachable_hosts.add(host)
-                return True
-            except:
-                return False
+        # if host in self._reachable_hosts:
+        #     return False
+
+        # logger.info(f"Checking if {host} is reachable through sockets")
+        # try:
+        #     socket.getaddrinfo(host, 80)
+        # except socket.gaierror:
+        #     self._unreachable_hosts.add(host)
+        #     return True
+        # except:
+        #     try:
+        #         socket.getaddrinfo(host, 443)
+        #     except:
+        #         self._unreachable_hosts.add(host)
+        #         return True
+
+        # self._reachable_hosts.add(host)
         return False
 
     def _is_relevant_text(self, soup_element):
@@ -434,8 +443,10 @@ class Crawler:
 
     def _get_crawl_delay_from_policy(self, robots_policy):
         crawl_delay = robots_policy.delay
-        if crawl_delay == None or crawl_delay > self._max_crawl_delay:
+        if crawl_delay == None:
             crawl_delay = self._default_crawl_delay
+        elif crawl_delay > self._max_crawl_delay:
+            crawl_delay = self._max_crawl_delay
         return crawl_delay
 
     def _find_hrefs(self, soup):
@@ -464,7 +475,7 @@ class Crawler:
 
         if href == ' ':
             return None
-        elif href.startswith('javascript:'):
+        elif href.startswith('javascript:') or href.startswith('mailto:'):
             return None
         elif href.startswith("/"):
             normalized_url = protocol + "://" + host + href
@@ -513,20 +524,24 @@ class Crawler:
 
         logger.debug(f'({tid}) Got response status: {resp.status}')
 
-        content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
-        if (content_types == None or
-            VALID_CONTENT_TYPE not in content_types
-        ):
+        try:
+            content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
+            if (content_types == None or
+                VALID_CONTENT_TYPE not in content_types
+            ):
+                return None
+            
+            soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
+            
+            if self._config.debug:
+                self._print_debug(url, soup)
+                
+            # Transform hrefs into normalized URLs based on parent
+            hrefs = self._find_hrefs(soup)
+            normalized_child_urls = self._get_href_normalized_urls(url, hrefs)
+        except Exception as e:
+            logger.info(f"({tid}) Error parsing '{url}': {e}")
             return None
-
-        soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
-        
-        if self._config.debug:
-            self._print_debug(url, soup)
-
-        # Transform hrefs into normalized URLs based on parent
-        hrefs = self._find_hrefs(soup)
-        normalized_child_urls = self._get_href_normalized_urls(url, hrefs)
 
         return normalized_child_urls
 
@@ -537,44 +552,51 @@ class Crawler:
 
         crawled_parent_urls = []
         crawled_child_urls = []
+        num_failures = 0
 
-        # Get robots.txt information to avoid being blocked.
-        if self._register_robot_policy(host) == False:
-            log.info(f"({tid}) Something went wrong when getting crawl delay. "+
-                     f"Returning.")
-            # Make sure that these URLs return to the 'to crawl' list.
-            crawled_child_urls.extend(parent_urls)
-            return host, [], crawled_child_urls
-        robots_policy = self._robots_cache[host]
-        crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
+        try:
+            # Get robots.txt information to avoid being blocked.
+            if self._register_robot_policy(host) == False:
+                log.info(f"({tid}) Something went wrong when registering robot "+
+                         f"policy. Returning with no-op.")
+                # Make sure that these URLs return to the 'to crawl' list.
+                crawled_child_urls.extend(parent_urls)
+                return host, [], crawled_child_urls
+            robots_policy = self._robots_cache[host]
+            crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
 
-        out_fpath = str(tid) + "_" + self._config.output_pages_path
-        with capture_http(out_fpath):
-            logger.debug(f"({tid}) Capturing pages to '{out_fpath}'")
-
-            for parent_url in parent_urls:
-                if not robots_policy.allowed(parent_url):
-                    continue
-
-                child_urls = self._crawl_url(tid, http_pool, parent_url)
-
-                if child_urls == None:
-                    continue
-
-                crawled_parent_urls.append(parent_url)
-                crawled_child_urls.extend(child_urls)
+            out_fpath = str(tid) + "_" + self._config.output_pages_path
+            with capture_http(out_fpath):
+                logger.debug(f"({tid}) Capturing pages to '{out_fpath}'")
                 
-                # Wait a bit to avoid being blocked. Must follow policy defined
-                # in <host>/robots.txt.
-                #
-                # For this to work, it is assumed that the shard the thread
-                # received contains only URLs for a single host.
-                logger.debug(f"({tid}) Sleeping crawl delay of "+
-                             f"{crawl_delay} seconds")
-                time.sleep(crawl_delay)
-
-        self._active_hosts[host] = False
+                for parent_url in parent_urls:
+                    if not robots_policy.allowed(parent_url):
+                        continue
+                    
+                    child_urls = self._crawl_url(tid, http_pool, parent_url)
+                    
+                    if child_urls == None:
+                        num_failures += 1
+                        if num_failures >= self._max_num_failures_unreachable:
+                            break
+                        continue
+                    
+                    crawled_parent_urls.append(parent_url)
+                    crawled_child_urls.extend(child_urls)
+                    
+                    # Wait a bit to avoid being blocked. Must follow policy defined
+                    # in <host>/robots.txt.
+                    #
+                    # For this to work, it is assumed that the shard the thread
+                    # received contains only URLs for a single host.
+                    logger.debug(f"({tid}) Sleeping crawl delay of "+
+                                 f"{crawl_delay} seconds")
+                    time.sleep(crawl_delay)
+        except Exception as e:
+            logger.error(f"({tid}) Received uncaught exception while crawling: "+
+                         f"{e}. Returning immediately.")
+            # Please return immediately!
 
         logger.debug(f"({tid}) Finished crawling.")
 
-        return host, crawled_parent_urls, crawled_child_urls
+        return host, num_failures, crawled_parent_urls, crawled_child_urls
