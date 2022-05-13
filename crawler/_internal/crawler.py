@@ -76,7 +76,7 @@ class Crawler:
     # Default timeout of a request, in seconds
     _default_timeout = 2
     # Default crawl delay. Is used when fetching of robots.txt fails.
-    _default_crawl_delay = 0.15
+    _default_crawl_delay = 0.1
     # Maximum delay to wait between successive requests to a web page.
     _max_crawl_delay = 2
     # Final size of each WARC file.
@@ -257,6 +257,11 @@ class Crawler:
                 tocrawl[host] = new_urls
 
         for host in tocrawl:
+            if len(results) > max(2, 2 * (
+                    (self._config.page_limit - crawl_package.total_crawled) //
+                    self._warc_file_page_shard
+            )):
+                return
             # Submit job with dedicated HTTP pool
             http_pool = urllib3.PoolManager(headers=Crawler._default_http_headers)
             results.append(executor.submit(self._crawl, host, tocrawl[host],
