@@ -7,13 +7,19 @@ class CrawlPackage():
         self.total_tocrawl = sum([tocrawl[host] for host in tocrawl])
         self.total_crawled = sum([crawled[host] for host in crawled])
 
-    def add_urls_crawled(self, host, urls):
+    def add_urls_crawled(self, host, urls, max_crawled=None):
         self.total_crawled += len(urls)
-        cache_urls(self.crawled, host, urls)
+        if max_crawled != None:
+            cache_urls(self.crawled, host, urls[:max_crawled])
+        else:
+            cache_urls(self.crawled, host, urls)
 
-    def add_urls_tocrawl(self, host, urls):
+    def add_urls_tocrawl(self, host, urls, max_tocrawl=None):
         self.total_tocrawl += len(urls)
-        cache_urls(self.tocrawl, host, urls)
+        if max_tocrawl != None:
+            cache_urls(self.tocrawl, host, urls[:max_tocrawl])
+        else:
+            cache_urls(self.tocrawl, host, urls)
 
     def remove_crawled(self, host):
         if self.crawled.get(host):

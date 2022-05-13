@@ -67,17 +67,16 @@ class Crawler:
     _max_urls_per_job = 25
     # Max URLs that can be cached for any host, at any given time. This goes to
     # ensure that we can parallelize the crawling well.
-    _max_urls_per_host = 250
-    # This overflow above the objective number of pages (page_limit) exists so
-    # that we don't run out of pages to crawl.
-    _page_limit_overflow_allowed = 100000
+    _max_urls_per_host = 1000
+    # Maximum number of hosts that can be cached.
+    _max_num_hosts = 10000
     # If this number of failures in a single 'batch' a thread takes to process,
     # the host is considered to be unreachable for the rest of the program.
     _max_num_failures_unreachable = 5
     # Default timeout of a request, in seconds
     _default_timeout = 2
     # Default crawl delay. Is used when fetching of robots.txt fails.
-    _default_crawl_delay = 0.2
+    _default_crawl_delay = 0.15
     # Maximum delay to wait between successive requests to a web page.
     _max_crawl_delay = 2
     # Final size of each WARC file.
@@ -201,7 +200,7 @@ class Crawler:
 
                 completed, not_completed = concurrent.futures.wait(
                     results,
-                    timeout=1,
+                    timeout=2,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 results = list(not_completed)
@@ -302,25 +301,22 @@ class Crawler:
         for host in recently_crawled:
             crawl_package.add_urls_crawled(host, recently_crawled[host])
 
-        if (crawl_package.total_tocrawl + crawl_package.total_crawled >=
-            self._config.page_limit + self._page_limit_overflow_allowed
-        ):
-            return
-
         for host in potentially_new_tocrawl:
+            if (host not in crawl_package.tocrawl and
+                len(crawl_package.tocrawl) >= self._max_num_hosts
+            ):
+                continue
+            elif (crawl_package.tocrawl.get(host) != None and
+                len(crawl_package.tocrawl[host]) >= self._max_urls_per_host
+            ):
+                continue
+
             robots_policy = self._robots_cache.get(host)
             if robots_policy == None:
                 # Just put the hash entry, but don't fill in the robots
                 # policy. Let the worker threads do it, to avoid getting stuck
                 # here.
                 self._robots_cache[host] = None
-
-            if (len_two_dicts_entry(crawl_package.crawled,
-                                    crawl_package.tocrawl, host) > 
-                self._max_urls_per_host
-            ):
-                # Skip this host
-                continue
 
             # Check if site can be reached at all. If not, don't bother with
             # it. This can save many seconds of our life.
@@ -339,7 +335,8 @@ class Crawler:
                     continue
                 new_urls.append(url)
             if len(new_urls) > 0:
-                crawl_package.add_urls_tocrawl(host, new_urls)
+                crawl_package.add_urls_tocrawl(host, new_urls,
+                                               self._max_urls_per_host)
 
     def _shutdown_threads(self, executor, results):
         logger.info("Shutting down...")
@@ -419,8 +416,8 @@ class Crawler:
             return False
         return True
 
-    # _find_relevant_text a string with the first 20 relevant words of text in
-    # the given BeautifulSoup object.
+    # _find_relevant_text returns a string with the first 20 relevant words of
+    # text in the given BeautifulSoup object.
     def _find_relevant_text(self, soup, num_relevant_words=20):
         texts = soup.findAll(text=True)
         
@@ -441,6 +438,8 @@ class Crawler:
 
         return " ".join(relevant_words[:num_relevant_words])
 
+    # _pring_debug prints useful information about a page when the -d flag is
+    # activated.
     def _print_debug(self, url, soup):
         debug_json_obj = {}
         debug_json_obj['URL'] = url
@@ -465,8 +464,6 @@ class Crawler:
         if self._robots_cache.get(host) != None:
             return True
 
-        # TODO: be more careful with which types of exceptions to catch.
-        #
         # Try to get robots.txt policy using both HTTP and HTTPS.
         logger.info(f"({tid}) Registering new robots policy for host {host}")
         requests_headers = headers={'timeout': str(self._default_timeout)}
@@ -498,9 +495,8 @@ class Crawler:
             self._use_default_robot_policy(host)
             return True
 
-        policy = robots_resp.agent(Crawler._default_user_agent)
-
         # Cache the info
+        policy = robots_resp.agent(Crawler._default_user_agent)
         self._robots_cache[host] = policy
 
         return True
@@ -512,11 +508,6 @@ class Crawler:
         elif crawl_delay > self._max_crawl_delay:
             crawl_delay = self._max_crawl_delay
         return crawl_delay
-
-    def _find_hrefs(self, soup):
-        links = soup.findAll('a')
-        hrefs = [link.attrs.get('href') for link in links]
-        return hrefs
 
     # _get_href_normalized_url transforms an href into a normalized URL,
     # according to its parent URL. This also works in favor of avoiding page
@@ -624,33 +615,57 @@ class Crawler:
             return None, None
         return req, resp
 
-    def _crawl_url(self, tid, http_pool, url):
-        logger.debug(f"({tid}) Crawling url: {url}")
+    def _safe_request(self, http_pool, request_type, url, tid="Unknown"):
         try:
-            resp = http_pool.request('GET', url, timeout=self._default_timeout)
+            resp = http_pool.request(request_type, url, timeout=self._default_timeout)
         except urllib3.exceptions.MaxRetryError as e:
-            logger.info(f"({tid}) Timeout for parent url '{url}': {e}")
+            logger.info(f"({tid}) Timeout for url '{url}': {e}")
             return None
         except Exception as e:
-            logger.info(f"({tid}) Error when requesting for '{url}': {e}")
+            logger.info(f"({tid}) Unknown error when requesting for '{url}': {e}")
+            return None
+        return resp
+
+    def _filter_html_pages(self, http_pool, urls, tid="Unknown"):
+        html_pages = []
+        num_failures = 0
+        for url in urls:
+            resp = self._safe_request(http_pool, 'HEAD', url, tid=tid)
+            if resp == None:
+                num_failures += 1
+                continue
+
+            content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
+            if (content_types == None or
+                VALID_CONTENT_TYPE not in content_types
+            ):
+                continue
+
+            html_pages.append(url)
+
+        return html_pages, num_failures
+
+    def _find_hrefs_in_soup(self, soup):
+        links = soup.findAll('a')
+        hrefs = [link.attrs.get('href') for link in links]
+        return hrefs
+
+    def _crawl_url(self, http_pool, url, tid="Unknown"):
+        logger.debug(f"({tid}) Crawling url: {url}")
+        resp = self._safe_request(http_pool, 'GET', url, tid=tid)
+        if resp == None:
             return None
 
         logger.debug(f'({tid}) Got response status: {resp.status}')
 
         try:
-            content_types = resp.getheaders().get(CONTENT_TYPE_KEY)
-            if (content_types == None or
-                VALID_CONTENT_TYPE not in content_types
-            ):
-                return None
-            
             soup = BeautifulSoup(resp.data, SOUP_PARSER)
             
             if self._config.debug:
                 self._print_debug(url, soup)
                 
             # Transform hrefs into normalized URLs based on parent
-            hrefs = self._find_hrefs(soup)
+            hrefs = self._find_hrefs_in_soup(soup)
             normalized_child_urls = self._get_href_normalized_urls(url, hrefs)
         except Exception as e:
             logger.info(f"({tid}) Error parsing '{url}': {e}")
@@ -673,9 +688,10 @@ class Crawler:
             fileidx, warc_file, already_crawled, success = self._pop_warc_file()
             if success != True:
                 # This may indicate that there are no free files, and the limit
-                # number of files has already been reached.
+                # number of files has already been reached, for example.
                 logger.info(f"({tid}) Unable to lock a WARC file. "+
                             f"Returning with no-op.")
+                # Make sure that these URLs return to the 'to crawl' list.
                 crawled_child_urls.extend(parent_urls)
                 return host, 0, [], crawled_child_urls
             logger.debug(f"({tid}) Capturing pages to '{warc_file}'")
@@ -690,8 +706,17 @@ class Crawler:
             robots_policy = self._robots_cache[host]
             crawl_delay = self._get_crawl_delay_from_policy(robots_policy)
 
+            # Check if page contains HTML content beforehand. Getting only the
+            # header avoids overheads if the target page has a lot of content.
+            html_urls, num_failures = self._filter_html_pages(http_pool,
+                                                              parent_urls, tid=tid)
+            if num_failures >= self._max_num_failures_unreachable:
+                logger.info(f"({tid}) Reached max number of failures "+
+                            f"for host '{host}'.")
+                return host, num_failures, [], []
+
             with capture_http(warc_file, self._filter_bad_requests):
-                for parent_url in parent_urls:
+                for parent_url in html_urls:
                     if (already_crawled + len(crawled_parent_urls) >=
                         self._warc_file_page_shard
                     ):
@@ -702,7 +727,8 @@ class Crawler:
                     if not robots_policy.allowed(parent_url):
                         continue
 
-                    child_urls = self._crawl_url(tid, http_pool, parent_url)
+                    # Here is the main call, where the GET request will be made.
+                    child_urls = self._crawl_url(http_pool, parent_url, tid=tid)
 
                     if child_urls == None:
                         num_failures += 1
@@ -723,7 +749,7 @@ class Crawler:
                                     already_crawled + len(crawled_parent_urls))
         except Exception as e:
             logger.error(f"({tid}) Received uncaught exception while crawling: "+
-                         f"{e}. Returning immediately.")
+                         f"{e}. Returning immediately.", exc_info=True)
             try:
                 self._release_warc_file(fileidx,
                                         already_crawled + len(crawled_parent_urls))
