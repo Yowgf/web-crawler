@@ -10,7 +10,6 @@ import os
 from threading import get_ident
 from threading import Lock
 import time
-import unicodedata
 
 # Crawling libraries
 #
@@ -77,12 +76,13 @@ class Crawler:
     _max_num_failures_unreachable = 5
     # Default timeout of a request, in seconds
     _default_timeout = 2
-    # Crawl delay constants, in seconds
+    # Default crawl delay. Is used when fetching of robots.txt fails.
     _default_crawl_delay = 0.2
+    # Maximum delay to wait between successive requests to a web page.
     _max_crawl_delay = 2
-    #
+    # Final size of each WARC file.
     _warc_file_page_limit = 1000
-    # We let threads work with more files, to avoid ruining the parallelism.
+    # We let threads work with smaller files, to avoid ruining the parallelism.
     _warc_file_page_shard = _max_urls_per_job * 2
 
     def __init__(self, config):
@@ -96,8 +96,8 @@ class Crawler:
             ),
             32
         )
-        if self._max_workers <= 0:
-            self._max_workers = 1
+        # Minimum 5
+        self._max_workers = max(self._max_workers, 5)
         # Maximum number of registered jobs, i.e. tasks in the pool at any given
         # time.
         self._max_njobs = self._max_workers * 4
@@ -153,6 +153,7 @@ class Crawler:
         for fpath in glob.glob("*_" + self._config.output_pages_path):
             os.remove(fpath)
 
+    # run_timed calls run() and measures elapsed time.
     def run_timed(self):
         before = datetime.now()
 
@@ -214,14 +215,15 @@ class Crawler:
 
             self._shutdown_threads(executor, results)
         self._aggregate_warc_files()
+        self._print_statistics()
 
     def _submit_jobs(self, crawl_package, executor, results):
         if crawl_package.total_tocrawl == 0:
             return
 
+        # This is the object that we will be filling in the loop below
         tocrawl = {}
-        # TODO: Although not necessary, we could choose the host randomly in the
-        # future to improve load balancing.
+
         hosts = list(crawl_package.tocrawl.keys())
         while True:
             # Very important to have this maximum jobs limit.
@@ -230,6 +232,7 @@ class Crawler:
             if len(hosts) == 0:
                 break
 
+            # Pick a host randomly
             hostidx = random.randint(0, len(hosts)-1)
             host = hosts.pop(hostidx)
 
@@ -263,12 +266,10 @@ class Crawler:
 
     # _process_complete_future takes a completed crawling task and processes
     # it. It removes the crawled host from the list of active hosts, and
-    # registers the new crawled URLs to be crawled later on.
-    #
-    # The function returns True if the master thread should stop, or False
-    # otherwise.
+    # registers the URLs crawled in the task.
     def _process_complete_future(self, crawl_package, future):
-        # .result() doesn't throw exceptions.
+        # .result() must be built to not throw exceptions, otherwise the program
+        # might crash here.
         host, num_failures, crawled_urls, new_urls = future.result()
 
         if num_failures >= self._max_num_failures_unreachable:
@@ -281,8 +282,8 @@ class Crawler:
         logger.info(f"Found {len(new_urls)} potentially new URLs")
         self._register_urls(crawl_package, {host: crawled_urls}, tocrawl)
 
-    # _get_tocrawl separates the urls into different hosts to form a dict
-    # host->url.
+    # _get_tocrawl receives a list of URLs. It returns a dict host->URL
+    # containing all URLs given in that list.
     def _get_tocrawl(self, urls):
         tocrawl = {}
         for url in urls:
@@ -292,6 +293,10 @@ class Crawler:
             tocrawl[host].append(url)
         return tocrawl
 
+    # _register_urls puts crawled and to-crawl URLs in the global cache.
+    #
+    # _register_urls only adds an URL to the global cache of URLs 'to-crawl' if
+    # it is a new URL.
     def _register_urls(self, crawl_package, recently_crawled,
                        potentially_new_tocrawl):
         for host in recently_crawled:
@@ -345,6 +350,13 @@ class Crawler:
         # executor.shutdown(wait=False)
         logger.info("Shut down.")
 
+    # _aggregate_warc_files transforms the WARC files that each thread uses into
+    # files with the proper size.
+    #
+    # For example, if each thread is allowed to lock a file that fits 50 pages,
+    # and the final chunk size is 1000 pages per file, then this function will
+    # do the following: for every 20 files of size 50, it will convert them into
+    # a single one with size 1000.
     def _aggregate_warc_files(self):
         logger.info(f"Aggregating WARC files into chunks of size "+
                     f"{self._warc_file_page_limit}.")
@@ -388,6 +400,10 @@ class Crawler:
             os.remove(fpath)
 
         logger.info("Done aggregating WARC files.")
+
+    def _print_statistics(self):
+        logger.info(f"Number of crawled pages: {self._crawl_package.total_crawled}")
+        logger.info(f"Number of unique domains: {len(self._crawl_package.crawled)}")
 
     def _is_host_unreachable(self, host):
         if host in self._unreachable_hosts:
@@ -466,9 +482,11 @@ class Crawler:
             except requests.Timeout as e:
                 logger.info(f"Timeout while fetching robots page "+
                             f"'{robots_url}' with {HTTPS_SCHEME}: {e}")
-                # Indicate that something went wrong by returning None. We can
-                # try again later.
-                return False
+                # Previously, we used to return False here, and not set any
+                # policy. But that led to an infinite loop of retrying for some
+                # host.
+                self._use_default_robot_policy(host)
+                return True
             except Exception as e:
                 logger.info(f"Caught exception while fetching robots page "+
                             f"'{robots_url}': {e}. Using default robot policy.")
@@ -626,7 +644,7 @@ class Crawler:
             ):
                 return None
             
-            soup = soup = BeautifulSoup(resp.data, SOUP_PARSER)
+            soup = BeautifulSoup(resp.data, SOUP_PARSER)
             
             if self._config.debug:
                 self._print_debug(url, soup)
@@ -696,12 +714,7 @@ class Crawler:
                     
                     crawled_parent_urls.append(parent_url)
                     crawled_child_urls.extend(child_urls)
-                    
-                    # Wait a bit to avoid being blocked. Must follow policy defined
-                    # in <host>/robots.txt.
-                    #
-                    # For this to work, it is assumed that the shard the thread
-                    # received contains only URLs for a single host.
+
                     logger.debug(f"({tid}) Sleeping crawl delay of "+
                                  f"{crawl_delay} seconds")
                     time.sleep(crawl_delay)
