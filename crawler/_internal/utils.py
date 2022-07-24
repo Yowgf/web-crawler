@@ -105,21 +105,21 @@ def suppress_output():
         finally:
             sys.stdout = old_stdout
 
-# # This class' implementation was obtained from stack overflow:
-# #
-# # https://stackoverflow.com/questions/11195140/break-or-exit-out-of-with-statement
-# class fragile_with(object):
-#     class Break(Exception):
-#       """Break out of the with statement"""
+# This class' implementation was obtained from stack overflow:
+#
+# https://stackoverflow.com/questions/11195140/break-or-exit-out-of-with-statement
+class fragile_with(object):
+    class Break(Exception):
+      """Break out of the with statement"""
 
-#     def __init__(self, value):
-#         self.value = value
+    def __init__(self, value):
+        self.value = value
 
-#     def __enter__(self):
-#         return self.value.__enter__()
+    def __enter__(self):
+        return self.value.__enter__()
 
-#     def __exit__(self, etype, value, traceback):
-#         error = self.value.__exit__(etype, value, traceback)
-#         if etype == self.Break:
-#             return True
-#         return error
+    def __exit__(self, etype, value, traceback):
+        error = self.value.__exit__(etype, value, traceback)
+        if etype == self.Break:
+            return True
+        return error
